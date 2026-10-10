@@ -7,6 +7,7 @@ import Html exposing (..)
 import Html.Attributes as Attr exposing (class, disabled, for, id, placeholder, type_, value)
 import Html.Events exposing (onClick, onInput, onSubmit)
 import Json.Decode as D
+import View.RecordPicker as RecordPicker
 import Types exposing (..)
 import View.Format exposing (formatCurrency, formatCurrencyWith)
 import View.Helpers exposing (detailCard, detailEmpty, detailStat, infoRow, initials, paginationBar, svgIcon, svgPath)
@@ -173,6 +174,7 @@ paymentItem pmt =
 
                   else
                     span [ class "activity-item__time" ] [ text pmt.paidOn ]
+                , span [ class "activity-item__kind" ] [ text (if pmt.status == "pending_approval" then "Awaiting approval" else if pmt.status == "void" then "Rejected / void" else if not (String.isEmpty pmt.reviewedBy) then "Approved" else String.replace "_" " " pmt.status) ]
                 , if String.isEmpty pmt.method then
                     text ""
 
@@ -189,7 +191,11 @@ paymentItem pmt =
                             "Ref: " ++ pmt.reference
                         )
                     ]
-                , button
+                , if pmt.status == "pending_approval" || pmt.status == "void" || not (String.isEmpty pmt.reviewedBy) then
+                    text ""
+
+                  else
+                    button
                     [ class "row-action row-action--danger row-action--tiny"
                     , type_ "button"
                     , Attr.title "Delete payment"
@@ -286,6 +292,7 @@ invoiceDetailView model inv =
             , detailStat "Balance" (formatCurrencyWith inv.currency inv.balance) "Outstanding"
             , detailStat "Gov fee" (formatCurrencyWith inv.currency inv.governmentFee) "Pass-through"
             ]
+        , node "crm-invoice-status" [ Attr.attribute "record-id" inv.id, id "receipt-approvals" ] []
         , div [ class "detail__grid" ]
             [ aside [ class "detail__sidebar" ]
                 [ detailCard "Invoice info"
@@ -298,7 +305,7 @@ invoiceDetailView model inv =
                         , infoRow iconDeals "Partner payable" (formatCurrencyWith inv.currency inv.partnerPayable)
                         , infoRow iconMail "Method" (display inv.paymentMethod)
                         , infoRow iconCalendar "Receipt #" (display inv.officialReceiptNumber)
-                        , infoRow iconUserTiny "Approved by" (display inv.paymentApproval)
+                        , infoRow iconUserTiny "Approval note" (display inv.paymentApproval)
                         , infoRow iconCalendar "Created" (display inv.createdAt)
                         ]
                     )
@@ -435,83 +442,23 @@ invoiceRichField inv fieldId labelText inputType =
 
 
 invoiceClientSelect : Model -> InvoiceForm -> Html Msg
-invoiceClientSelect model inv =
-    let
-        opts =
-            case model.contacts of
-                Success d ->
-                    List.sortBy .name d.items
-
-                _ ->
-                    []
-
-        err =
-            invoiceFormFieldError "clientId" inv
-
-        cls =
-            case err of
-                Just _ ->
-                    "ecc-field ecc-field--error"
-
-                Nothing ->
-                    "ecc-field"
-    in
-    div [ class cls ]
-        ([ select
-            [ id "inv-clientId"
-            , onInput (UpdatedInvoiceFormField "clientId")
-            , disabled inv.submitting
-            ]
-            (option [ value "", Attr.selected (inv.clientId == "") ]
-                [ text "Select a client" ]
-                :: List.map
-                    (\c ->
-                        option
-                            [ value c.id, Attr.selected (inv.clientId == c.id) ]
-                            [ text c.name ]
-                    )
-                    opts
-            )
-         , label [ for "inv-clientId" ] [ text "Client" ]
-         ]
-            ++ (case err of
-                    Just msg ->
-                        [ p [ class "ecc-field__message" ] [ text msg ] ]
-
-                    Nothing ->
-                        []
-               )
-        )
+invoiceClientSelect _ inv =
+    div [ class "ecc-field" ]
+        [ span [ class "ecc-field__label" ] [ text "Client" ]
+        , RecordPicker.view "inv-clientId" "contacts" inv.clientId "Find client" inv.submitting (UpdatedInvoiceFormField "clientId")
+        , case invoiceFormFieldError "clientId" inv of
+            Just message ->
+                p [ class "ecc-field__message" ] [ text message ]
+            Nothing ->
+                text ""
+        ]
 
 
 invoiceCaseSelect : Model -> InvoiceForm -> Html Msg
-invoiceCaseSelect model inv =
-    let
-        opts =
-            case model.cases of
-                Success d ->
-                    List.sortBy .caseNumber d.items
-
-                _ ->
-                    []
-    in
+invoiceCaseSelect _ inv =
     div [ class "ecc-field" ]
-        [ select
-            [ id "inv-caseId"
-            , onInput (UpdatedInvoiceFormField "caseId")
-            , disabled inv.submitting
-            ]
-            (option [ value "", Attr.selected (inv.caseId == "") ]
-                [ text "No case linked" ]
-                :: List.map
-                    (\c ->
-                        option
-                            [ value c.id, Attr.selected (inv.caseId == c.id) ]
-                            [ text c.caseNumber ]
-                    )
-                    opts
-            )
-        , label [ for "inv-caseId" ] [ text "Case" ]
+        [ span [ class "ecc-field__label" ] [ text "Application" ]
+        , RecordPicker.view "inv-caseId" "cases" inv.caseId "Find application" inv.submitting (UpdatedInvoiceFormField "caseId")
         ]
 
 
@@ -577,7 +524,7 @@ invoiceFormView model inv isEdit =
             , invoiceRichField inv "refundStatus" "Refund status" "text"
             , invoiceRichField inv "referralCommission" "Referral commission" "number"
             , invoiceRichField inv "partnerPayable" "Partner payable" "number"
-            , invoiceRichField inv "paymentApproval" "Payment approval" "text"
+            , invoiceRichField inv "paymentApproval" "Approval note (legacy)" "text"
             ]
         , milestonePills inv
         , div [ class "ecc-field ecc-field--notes" ]
@@ -820,6 +767,19 @@ paymentFormModal pf =
                         ]
                         []
                     ]
+                , label [ class "receipt-choice" ]
+                    [ input [ id "pf-requireApproval", type_ "checkbox", Attr.checked pf.requireApproval, disabled pf.submitting, Html.Events.onCheck (\checked -> UpdatedPaymentFormField "requireApproval" (if checked then "true" else "false")), Html.Events.stopPropagationOn "click" (D.map (\checked -> ( UpdatedPaymentFormField "requireApproval" (if checked then "true" else "false"), True )) (D.at [ "target", "checked" ] D.bool)) ] []
+                    , text "Request manager approval; keep this receipt out of the posted balance until approved."
+                    ]
+                , case fieldErr "duplicate" of
+                    Just _ ->
+                        label [ class "receipt-choice" ]
+                            [ input [ id "pf-confirmDuplicate", type_ "checkbox", Attr.checked pf.confirmDuplicate, disabled pf.submitting, Html.Events.onCheck (\checked -> UpdatedPaymentFormField "confirmDuplicate" (if checked then "true" else "false")), Html.Events.stopPropagationOn "click" (D.map (\checked -> ( UpdatedPaymentFormField "confirmDuplicate" (if checked then "true" else "false"), True )) (D.at [ "target", "checked" ] D.bool)) ] []
+                            , text "I checked payment history and confirm this is a separate receipt."
+                            ]
+
+                    Nothing ->
+                        text ""
                 , div [ class "modal__actions" ]
                     [ button
                         [ type_ "button"

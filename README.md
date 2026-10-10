@@ -6,8 +6,8 @@ students, agents, leads, cases, document tracking, invoices, payments, and partn
 ## Features
 
 - Conversational **Ask ECC AI** adviser throughout the workspace: ask follow-up
-  questions, get advice on the current record, and plan your day. Optional browser
-  microphone input and spoken replies. Requires AI provider configuration and
+  questions, get advice on the current record, and plan your day. Saved conversations, source links and explicit staff confirmation for proposed
+  actions. Optional realtime voice endpoints require separate configuration. Requires AI provider configuration and
   workspace activation; see [the AI guide](docs/EXPANSION.md#conversational-ai-adviser).
 
 - Light and dark workspace themes, saved in the browser; grouped navigation,
@@ -42,7 +42,7 @@ larger touch controls and mobile forms. See [docs/MOBILE.md](docs/MOBILE.md) for
 phone access and verification details.
 
 The maintained application is `src/`, `public/`, and `golang-backend/`.
-Other backend folders and `ecc-crm/` are earlier prototypes.
+Earlier implementations and unused style backups are preserved in `archive/`; see [archive/README.md](archive/README.md). They are excluded from the application build and Docker context.
 
 ## Database and migration
 
@@ -61,8 +61,12 @@ Malformed legacy data stops startup rather than replacing it with demo data.
 
 Schema migrations use SQLite `user_version`. Record tables store one row per
 record, with an ID, ordering, and JSON data; account credentials have dedicated
-columns. The application keeps a memory cache for existing CRM handlers. Run
-one backend process per database and make data changes through the API.
+columns. Runtime handlers and workers load committed SQL into private request
+state and persist guarded row changes. Separate-process regression tests cover
+concurrent writes, startup, account changes and recurring workers. SQLite still
+serializes writers; measure your workload before scaling. Processes sharing a
+database must also share the deployment secrets and file storage. Make data
+changes through the API.
 
 Back up the database using SQLite's backup command so committed WAL data is included:
 
@@ -133,3 +137,23 @@ Docker/Compose, CI, metrics and backup/restore scripts are included.
 See [docs/EXPANSION.md](docs/EXPANSION.md) for setup, verification and remaining
 provider/scaling limits. The older implementation checklist describes the previous
 feature set; it is not a production acceptance record for this expansion.
+
+## Daily work
+
+See [docs/DAILY_WORK.md](docs/DAILY_WORK.md) for My work today, the unified student journey, navigation presets, inline form warnings, integration connection checks, SQL repository changes and verification.
+
+## Next priorities
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the prioritized SQL migration,
+live integration acceptance tests, application handoffs, searchable record
+pickers, and adviser/finance usability sessions, including completion criteria
+and dependencies. These are planned work, not completed features.
+
+See [real integration acceptance](docs/INTEGRATION_ACCEPTANCE.md) for the runnable
+provider checks and [staff usability](docs/STAFF_USABILITY.md) for participant
+tasks and observation recording. Live provider acceptance and actual staff
+sessions remain pending.
+
+See [operational improvements](docs/OPERATIONAL_IMPROVEMENTS.md) for faster
+contact saves, application requirements, handoff reminders, duplicate receipt
+checks and optional manager approval.

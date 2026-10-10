@@ -6,6 +6,7 @@ module View.Layout exposing (mobileNavigation, pageDescription, pageTitle, sideb
 import Html exposing (..)
 import Html.Attributes as Attr exposing (class, type_)
 import Html.Events exposing (onClick)
+import Json.Encode
 import Svg
 import Types exposing (..)
 import View.Icons exposing (iconAgent, iconContacts, iconDeals, iconHome, iconLead, iconMoon, iconReports, iconSchool, iconSettings, iconSignOut, iconStudent, iconSun, iconTasks)
@@ -32,6 +33,7 @@ navItem current target label icon =
              else
                 "false"
             )
+        , Attr.attribute "data-nav-label" label
         , onClick (NavigatedTo target)
         ]
         [ span [ class "nav-item__icon" ] [ icon ]
@@ -84,35 +86,6 @@ anyLoading model =
         || isLoading model.caseDocuments
         || isLoading model.invoicePayments
 
-
-alertCount : Model -> Int
-alertCount model =
-    let
-        fromCases =
-            case model.cases of
-                Success d ->
-                    List.length (List.filter (\c -> c.priority == "Urgent") d.items)
-
-                _ ->
-                    0
-
-        fromSchools =
-            case model.schools of
-                Success d ->
-                    List.length (List.filter (\s -> s.contractStatus == "Pending") d.items)
-
-                _ ->
-                    0
-
-        fromAgents =
-            case model.agents of
-                Success d ->
-                    List.length (List.filter (\a -> a.contractStatus == "Not Signed") d.items)
-
-                _ ->
-                    0
-    in
-    fromCases + fromSchools + fromAgents
 
 
 sidebar : Model -> User -> Html Msg
@@ -173,22 +146,43 @@ sidebar model user =
                 [ class "sidebar__close", type_ "button", onClick ToggledSideBar, Attr.attribute "aria-label" "Close navigation" ]
                 [ text "×" ]
             ]
-        , nav [ class "sidebar__nav", Attr.attribute "aria-label" "CRM modules" ]
-            [ span [ class "sidebar__section-label" ] [ text "Workspace" ]
-            , navItem effectiveRoute Home "Overview" iconHome
-            , navItem effectiveRoute Tasks "Tasks" iconTasks
-            , navItem effectiveRoute Reports "Reports" iconReports
-            , span [ class "sidebar__section-label" ] [ text "Relationships" ]
-            , navItem effectiveRoute Contacts "Contacts" iconContacts
-            , navItem effectiveRoute Leads "Leads" iconLead
-            , navItem effectiveRoute Students "Students" iconStudent
-            , navItem effectiveRoute Schools "Schools" iconSchool
-            , navItem effectiveRoute Agents "Agents" iconAgent
-            , navItem effectiveRoute Partners "Partners" iconSchool
-            , span [ class "sidebar__section-label" ] [ text "Operations" ]
-            , navItem effectiveRoute Deals "Deals" iconDeals
-            , navItem effectiveRoute Cases "Cases" iconTasks
-            , navItem effectiveRoute Invoices "Invoices" iconDeals
+        , Html.node "crm-nav-focus"
+            [ Attr.attribute "user-id" user.id
+            , Attr.attribute "default-focus" (if user.role == "admin" || user.role == "manager" then "management" else "adviser")
+            ] []
+        , nav [ class "sidebar__nav", Attr.attribute "aria-label" "Daily work" ]
+            [ navItem effectiveRoute Home "My work today" iconHome
+            , div [ class "nav-preset nav-preset--adviser" ]
+                [ navItem effectiveRoute Students "Students" iconStudent
+                , navItem effectiveRoute Cases "Applications" iconTasks
+                , navItem effectiveRoute Leads "Leads" iconLead
+                , navItem effectiveRoute Tasks "Tasks" iconTasks
+                ]
+            , div [ class "nav-preset nav-preset--finance" ]
+                [ navItem effectiveRoute Invoices "Invoices & payments" iconDeals
+                , navItem effectiveRoute Reports "Reports" iconReports
+                , navItem effectiveRoute Tasks "Tasks" iconTasks
+                ]
+            , div [ class "nav-preset nav-preset--management" ]
+                [ if user.role == "admin" then navItem effectiveRoute Administration "System administration" iconSettings else text ""
+                , navItem effectiveRoute Workspace "Workspace tools" iconSettings
+                , navItem effectiveRoute Reports "Reports" iconReports
+                , navItem effectiveRoute Cases "Applications" iconTasks
+                ]
+            , details [ class "navigation-more", Attr.property "open" (Json.Encode.bool (List.member effectiveRoute [ Contacts, Schools, Agents, Partners, Deals ])) ]
+                [ summary [] [ text "All modules" ]
+                , navItem effectiveRoute Contacts "Contacts" iconContacts
+                , navItem effectiveRoute Leads "Leads" iconLead
+                , navItem effectiveRoute Students "Students" iconStudent
+                , navItem effectiveRoute Cases "Cases" iconTasks
+                , navItem effectiveRoute Tasks "Tasks" iconTasks
+                , navItem effectiveRoute Schools "Schools" iconSchool
+                , navItem effectiveRoute Agents "Agents" iconAgent
+                , navItem effectiveRoute Partners "Partners" iconSchool
+                , navItem effectiveRoute Deals "Deals" iconDeals
+                , navItem effectiveRoute Invoices "Invoices" iconDeals
+                , navItem effectiveRoute Reports "Reports" iconReports
+                ]
             ]
         , nav [ class "sidebar__nav sidebar__nav--bottom" ]
             [ navItem effectiveRoute Workspace "Workspace tools" iconSettings
@@ -223,6 +217,9 @@ mobileNavigation model =
     let
         selected =
             case model.route of
+                StudentDetail _ ->
+                    Students
+
                 ContactDetail _ ->
                     Contacts
 
@@ -233,12 +230,14 @@ mobileNavigation model =
                     route
 
         moreSelected =
-            model.sidebarOpen || not (List.member selected [ Home, Contacts, Cases, Tasks ])
+            model.sidebarOpen || not (List.member selected [ Home, Students, Cases, Tasks, Invoices, Reports ])
     in
     nav [ class "mobile-nav", Attr.attribute "aria-label" "Mobile navigation" ]
         [ navItem selected Home "Home" iconHome
-        , navItem selected Contacts "Clients" iconContacts
-        , navItem selected Cases "Cases" iconTasks
+        , navItem selected Students "Students" iconStudent
+        , navItem selected Cases "Applications" iconTasks
+        , navItem selected Invoices "Invoices" iconDeals
+        , navItem selected Reports "Reports" iconReports
         , navItem selected Tasks "Tasks" iconTasks
         , button
             [ class ("nav-item" ++ (if moreSelected then " nav-item--active" else ""))
@@ -350,7 +349,7 @@ pageTitle : Model -> String
 pageTitle model =
     case model.route of
         Home ->
-            "Overview"
+            "My work today"
 
         Contacts ->
             "Contacts"

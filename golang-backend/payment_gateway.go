@@ -55,17 +55,17 @@ func currencyMinor(currency string) int64 {
 	}
 	return 100
 }
-func handleCheckout(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+func (state *runtimeStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
+	state.mu.RLock()
 	var inv Invoice
 	ok := false
-	for _, i := range invoices {
+	for _, i := range state.invoices {
 		if i.ID == r.PathValue("id") {
 			inv = i
 			ok = true
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	if !ok {
 		writeError(w, 404, "Invoice not found")
 		return
@@ -83,6 +83,12 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"url": data["url"], "id": data["id"]})
+}
+
+func handleCheckout(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleCheckout(w, r)
 }
 func stripeSignatureValid(header string, body []byte) bool {
 	secret := os.Getenv("STRIPE_WEBHOOK_SECRET")
@@ -118,7 +124,7 @@ func stripeSignatureValid(header string, body []byte) bool {
 	}
 	return false
 }
-func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil || !stripeSignatureValid(r.Header.Get("Stripe-Signature"), body) {
 		writeError(w, 400, "Invalid payment signature")
@@ -166,23 +172,23 @@ func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, statusResponse{"already_processed"})
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	index := -1
-	for i, inv := range invoices {
+	for i, inv := range state.invoices {
 		if inv.ID == o.Metadata["invoice_id"] && inv.OrgID == o.Metadata["org_id"] {
 			index = i
 		}
 	}
-	if index < 0 || !strings.EqualFold(currencyOf(invoices[index].Currency), o.Currency) || o.AmountTotal <= 0 {
+	if index < 0 || !strings.EqualFold(currencyOf(state.invoices[index].Currency), o.Currency) || o.AmountTotal <= 0 {
 		writeError(w, 400, "Invoice or currency mismatch")
 		return
 	}
-	inv := invoices[index]
-	recomputeInvoiceLocked(index)
+	inv := state.invoices[index]
+	state.recomputeInvoiceLocked(index)
 	amount := float64(o.AmountTotal) / float64(currencyMinor(currencyOf(inv.Currency)))
-	payments = append(payments, Payment{RecordScope: inv.RecordScope, ID: newID("pay"), InvoiceID: inv.ID, Amount: amount, Status: "posted", PaidOn: time.Now().Format("2006-01-02"), Method: "Stripe", Reference: o.PaymentIntent, CreatedBy: "Stripe webhook", CreatedAt: utcNow()})
-	recomputeInvoiceLocked(index)
+	state.payments = append(state.payments, Payment{RecordScope: inv.RecordScope, ID: newID("pay"), InvoiceID: inv.ID, Amount: amount, Status: "posted", PaidOn: time.Now().Format("2006-01-02"), Method: "Stripe", Reference: o.PaymentIntent, CreatedBy: "Stripe webhook", CreatedAt: utcNow()})
+	state.recomputeInvoiceLocked(index)
 	_, err = storeDB(r).Exec("INSERT INTO workspace_entries VALUES(?,?, 'gateway_event','',?,?,?,?)", "stripe_event_"+event.ID, inv.OrgID, inv.ID, mustJSON(map[string]string{"paymentIntent": o.PaymentIntent, "checkoutId": o.ID}), utcNow(), utcNow())
 	if err != nil {
 		writeError(w, 500, "Could not record payment")
@@ -192,7 +198,13 @@ func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 	metadata(r).OrgID = inv.OrgID
 	writeJSON(w, 200, statusResponse{"processed"})
 }
-func handleGatewayRefund(w http.ResponseWriter, r *http.Request) {
+
+func handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleStripeWebhook(w, r)
+}
+func (state *runtimeStore) handleGatewayRefund(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager approval is required")
 		return
@@ -212,20 +224,20 @@ func handleGatewayRefund(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "Approve the refund first")
 		return
 	}
-	mu.RLock()
+	state.mu.RLock()
 	var inv Invoice
 	intent := ""
-	for _, i := range invoices {
+	for _, i := range state.invoices {
 		if i.ID == invoiceID {
 			inv = i
 		}
 	}
-	for _, p := range payments {
+	for _, p := range state.payments {
 		if p.InvoiceID == invoiceID && p.Method == "Stripe" {
 			intent = p.Reference
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	amount, _ := refund["amount"].(float64)
 	if inv.ID == "" || intent == "" || amount <= 0 || amount > inv.AmountReceived {
 		writeError(w, 400, "No eligible Stripe payment for this refund")
@@ -245,40 +257,46 @@ func handleGatewayRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if data["status"] != "succeeded" {
-		state := "provider_pending"
+		refundState := "provider_pending"
 		if data["status"] == "failed" || data["status"] == "canceled" {
-			state = "failed"
+			refundState = "failed"
 		}
-		refund["status"] = state
+		refund["status"] = refundState
 		refund["reference"] = data["id"]
 		if _, err = storeDB(r).Exec("UPDATE workspace_entries SET data=?,updated_at=? WHERE id=?", mustJSON(refund), utcNow(), req.RefundID); err != nil {
 			writeError(w, 500, "Could not record provider status")
 			return
 		}
-		mu.Lock()
-		for i := range invoices {
-			if invoices[i].ID == inv.ID {
-				invoices[i].RefundStatus = state
+		state.mu.Lock()
+		for i := range state.invoices {
+			if state.invoices[i].ID == inv.ID {
+				state.invoices[i].RefundStatus = refundState
 			}
 		}
-		mu.Unlock()
+		state.mu.Unlock()
 		writeJSON(w, 200, refund)
 		return
 	}
 
-	mu.Lock()
-	payments = append(payments, Payment{RecordScope: inv.RecordScope, ID: newID("pay"), InvoiceID: inv.ID, Amount: -amount, Status: "refund", Method: "Stripe refund", Reference: fmt.Sprint(data["id"]), PaidOn: organizationToday(r), CreatedBy: currentUser(r).Name, CreatedAt: utcNow()})
-	for i := range invoices {
-		if invoices[i].ID == inv.ID {
-			recomputeInvoiceLocked(i)
-			invoices[i].RefundStatus = "processed"
+	state.mu.Lock()
+	state.payments = append(state.payments, Payment{RecordScope: inv.RecordScope, ID: newID("pay"), InvoiceID: inv.ID, Amount: -amount, Status: "refund", Method: "Stripe refund", Reference: fmt.Sprint(data["id"]), PaidOn: organizationToday(r), CreatedBy: currentUser(r).Name, CreatedAt: utcNow()})
+	for i := range state.invoices {
+		if state.invoices[i].ID == inv.ID {
+			state.recomputeInvoiceLocked(i)
+			state.invoices[i].RefundStatus = "processed"
 		}
 	}
-	mu.Unlock()
+	state.mu.Unlock()
 	refund["status"] = "processed"
 	refund["reference"] = data["id"]
 	storeDB(r).Exec("UPDATE workspace_entries SET data=?,updated_at=? WHERE id=?", mustJSON(refund), utcNow(), req.RefundID)
 	writeJSON(w, 200, refund)
+}
+
+func handleGatewayRefund(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleGatewayRefund(w, r)
 }
 
 func stripeGet(path string) (map[string]any, error) {

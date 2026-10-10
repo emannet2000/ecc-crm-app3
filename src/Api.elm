@@ -111,6 +111,8 @@ paymentDecoder =
         |> andMap (optString "notes")
         |> andMap (optString "createdBy")
         |> andMap (optString "createdAt")
+        |> andMap (D.oneOf [ D.field "status" D.string, D.succeed "posted" ])
+        |> andMap (optString "reviewedBy")
 
 
 paymentsDecoder : D.Decoder (List Payment)
@@ -195,7 +197,9 @@ invoiceFormPayload inv =
 paymentFormPayload : String -> PaymentForm -> E.Value
 paymentFormPayload invoiceId pf =
     E.object
-        [ ( "invoiceId", E.string invoiceId )
+        [ ( "requireApproval", E.bool pf.requireApproval )
+        , ( "confirmDuplicate", E.bool pf.confirmDuplicate )
+        , ( "invoiceId", E.string invoiceId )
         , ( "amount", E.float (Maybe.withDefault 0 (String.toFloat pf.amount)) )
         , ( "paidOn", E.string pf.paidOn )
         , ( "method", E.string pf.method )

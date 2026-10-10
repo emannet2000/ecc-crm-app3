@@ -31,7 +31,7 @@ func openDatabase(path string) (*sql.DB, error) {
 	if err = os.Chmod(path, 0600); err != nil {
 		return nil, err
 	}
-	uri := (&url.URL{Scheme: "file", Path: path}).String() + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on&_synchronous=FULL"
+	uri := (&url.URL{Scheme: "file", Path: path}).String() + "?_busy_timeout=5000&_journal_mode=WAL&_foreign_keys=on&_synchronous=FULL&_txlock=immediate"
 	db, err := sql.Open("sqlite3", uri)
 	if err != nil {
 		return nil, err
@@ -102,8 +102,16 @@ func loadStore(path string) error {
 			database = nil
 		}
 	}()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("INSERT INTO app_meta(key,value) VALUES('writer_lock','1') ON CONFLICT(key) DO UPDATE SET value=value"); err != nil {
+		return err
+	}
 	var initialized string
-	err = db.QueryRow("SELECT value FROM app_meta WHERE key='initialized'").Scan(&initialized)
+	err = tx.QueryRow("SELECT value FROM app_meta WHERE key='initialized'").Scan(&initialized)
 	if err == sql.ErrNoRows {
 		legacy := os.Getenv("LEGACY_DATA_FILE")
 		if legacy == "" {
@@ -127,28 +135,26 @@ func loadStore(path string) error {
 		}
 		normalizeWorkspaceData()
 		applyComputedData()
-		if err = saveStore(); err != nil {
+		if err = saveDatabaseTx(tx, nil); err != nil {
 			return err
 		}
 	} else if err != nil {
 		return err
 	} else {
-		saved, err := readDatabase(db)
+		saved, err := readDatabase(tx)
 		if err != nil {
 			return err
 		}
 		restoreStore(saved)
-		normalizeWorkspaceData()
-		applyComputedData()
-		if err = saveStore(); err != nil {
-			return err
-		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
 	}
 	ok = true
 	return nil
 }
 
-func readRows[T any](db *sql.DB, table string) ([]T, error) {
+func readRows[T any](db rowQueryer, table string) ([]T, error) {
 	rows, err := db.Query("SELECT data FROM " + table + " ORDER BY sort_order,id")
 	if err != nil {
 		return nil, err
@@ -169,7 +175,7 @@ func readRows[T any](db *sql.DB, table string) ([]T, error) {
 	return items, rows.Err()
 }
 
-func readDatabase(db *sql.DB) (diskStore, error) {
+func readIdentityDatabase(db rowQueryer) (diskStore, error) {
 	saved := diskStore{Version: 1, Users: map[string]storedUser{}, Revoked: map[string]time.Time{}}
 	rows, err := db.Query("SELECT id,email,name,password_hash,session_version,org_id,team_id,role,disabled,two_factor_enabled,auth_data FROM users")
 	if err != nil {
@@ -220,6 +226,14 @@ func readDatabase(db *sql.DB) (diskStore, error) {
 	}
 	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return saved, err
+	}
+	return saved, nil
+}
+
+func readDatabase(db rowQueryer) (diskStore, error) {
+	saved, err := readIdentityDatabase(db)
 	if err != nil {
 		return saved, err
 	}

@@ -58,8 +58,8 @@ func handleSSOStart(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "ecc_oidc", Value: cookie, Path: "/api/sso", HttpOnly: true, Secure: secureCookie(r), SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.Redirect(w, r, conf.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), 302)
 }
-func finishIdentity(w http.ResponseWriter, r *http.Request, email, provider string) error {
-	u, ok := findUserByEmail(strings.ToLower(strings.TrimSpace(email)))
+func (state *runtimeStore) finishIdentity(w http.ResponseWriter, r *http.Request, email, provider string) error {
+	u, ok := state.findUserByEmail(strings.ToLower(strings.TrimSpace(email)))
 	if !ok || u.Disabled || !ipAllowed(r, u) {
 		return fmt.Errorf("Ask your administrator to create an active account for your identity-provider email")
 	}
@@ -79,7 +79,13 @@ func finishIdentity(w http.ResponseWriter, r *http.Request, email, provider stri
 	http.Redirect(w, r, appURL()+"/", 303)
 	return nil
 }
-func handleSSOCallback(w http.ResponseWriter, r *http.Request) {
+
+func finishIdentity(w http.ResponseWriter, r *http.Request, email, provider string) error {
+	state, release := runtimeForCall(r)
+	defer release()
+	return state.finishIdentity(w, r, email, provider)
+}
+func (state *runtimeStore) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie("ecc_oidc")
 	if err != nil {
 		writeError(w, 400, "Sign-in request expired")
@@ -134,16 +140,22 @@ func handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "ecc_oidc", Value: "", Path: "/api/sso", HttpOnly: true, Secure: secureCookie(r), MaxAge: -1, SameSite: http.SameSiteLaxMode})
-	if err = finishIdentity(w, r, claims.Email, "oidc"); err != nil {
+	if err = state.finishIdentity(w, r, claims.Email, "oidc"); err != nil {
 		writeError(w, 403, err.Error())
 	}
 }
-func handleSSOFinish(w http.ResponseWriter, r *http.Request) {
+
+func handleSSOCallback(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSSOCallback(w, r)
+}
+func (state *runtimeStore) handleSSOFinish(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Token, Code string }
 	if !decodeRequest(w, r, &req) {
 		return
 	}
-	u, err := consumeAuthToken(r, req.Token, "sso")
+	u, err := state.consumeAuthToken(r, req.Token, "sso")
 	if err != nil || !verifySecondFactor(&u, req.Code) {
 		writeError(w, 401, "Invalid or expired verification")
 		return
@@ -153,15 +165,21 @@ func handleSSOFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	storeDB(r).Exec("UPDATE auth_tokens SET used_at=? WHERE hash=?", utcNow(), hashSecret(req.Token))
-	mu.Lock()
-	users[strings.ToLower(u.Email)] = u
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[strings.ToLower(u.Email)] = u
+	state.mu.Unlock()
 	if err = mintSession(w, r, u, true); err != nil {
 		writeError(w, 500, "Could not complete sign-in")
 		return
 	}
 	securityEvent(r, u, "login.sso_mfa")
 	writeJSON(w, 200, statusResponse{"ok"})
+}
+
+func handleSSOFinish(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSSOFinish(w, r)
 }
 
 type crmSAMLSession struct{}
@@ -213,8 +231,10 @@ func samlConfiguration(r *http.Request) (*samlsp.Middleware, error) {
 	if os.Getenv("SAML_METADATA_URL") == "" {
 		return nil, fmt.Errorf("SAML is not configured")
 	}
-	if !strings.HasPrefix(appURL(),"https://"){return nil,fmt.Errorf("SAML sign-in requires an HTTPS APP_URL")}
- pair, err := tls.LoadX509KeyPair(os.Getenv("SAML_CERT_FILE"), os.Getenv("SAML_KEY_FILE"))
+	if !strings.HasPrefix(appURL(), "https://") {
+		return nil, fmt.Errorf("SAML sign-in requires an HTTPS APP_URL")
+	}
+	pair, err := tls.LoadX509KeyPair(os.Getenv("SAML_CERT_FILE"), os.Getenv("SAML_KEY_FILE"))
 	if err != nil {
 		return nil, fmt.Errorf("SAML certificate configuration is invalid")
 	}

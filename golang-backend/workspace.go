@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,22 +39,17 @@ func requestActor(r *http.Request) string {
 }
 
 func recordsOf(saved diskStore) map[string]map[string]string {
-	payload, _ := json.Marshal(saved)
-	var groups map[string]json.RawMessage
-	json.Unmarshal(payload, &groups)
 	result := map[string]map[string]string{}
+	groups := reflect.ValueOf(saved)
 	for _, table := range entityTables {
-		var items []json.RawMessage
-		// diskStore's group names use title case.
-		json.Unmarshal(groups[strings.ToUpper(table[:1])+table[1:]], &items)
-		result[table] = map[string]string{}
-		for _, item := range items {
-			var record struct {
-				ID string `json:"id"`
-			}
-			json.Unmarshal(item, &record)
-			result[table][record.ID] = string(item)
+		items := groups.FieldByName(strings.ToUpper(table[:1]) + table[1:])
+		records := make(map[string]string, items.Len())
+		for i := 0; i < items.Len(); i++ {
+			item := items.Index(i)
+			payload, _ := json.Marshal(item.Interface())
+			records[item.FieldByName("ID").String()] = string(payload)
 		}
+		result[table] = records
 	}
 	// Account history never includes passwords, hashes, or session tokens.
 	result["users"] = map[string]string{}
@@ -156,7 +152,7 @@ type SearchResult struct {
 	Subtitle string `json:"subtitle"`
 }
 
-func handleSearch(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if len([]rune(query)) < 2 {
 		writeJSON(w, 200, map[string]any{"results": []SearchResult{}, "truncated": false})
@@ -192,7 +188,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "Could not search records")
 			return
 		}
-		if _, visible := recordsOf(snapshot())[result.Entity][result.ID]; visible {
+		if _, visible := recordsOf(state.snapshot())[result.Entity][result.ID]; visible {
 			results = append(results, result)
 		}
 	}
@@ -205,6 +201,12 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		results = results[:30]
 	}
 	writeJSON(w, 200, map[string]any{"results": results, "truncated": truncated})
+}
+
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSearch(w, r)
 }
 
 func csvValue(value any) string {
@@ -231,7 +233,7 @@ func csvValue(value any) string {
 	}
 	return result
 }
-func handleExport(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleExport(w http.ResponseWriter, r *http.Request) {
 	table := r.PathValue("entity")
 	allowed := false
 	for _, name := range entityTables {
@@ -265,7 +267,7 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id, _ := data["id"].(string)
-		if _, visible := recordsOf(snapshot())[table][id]; !visible {
+		if _, visible := recordsOf(state.snapshot())[table][id]; !visible {
 			continue
 		}
 		records = append(records, data)
@@ -319,6 +321,12 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		writer.Write(line)
 	}
 	writer.Flush()
+}
+
+func handleExport(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleExport(w, r)
 }
 
 func auditScope(payload, entity string) RecordScope {

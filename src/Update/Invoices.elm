@@ -327,17 +327,23 @@ update msg model =
                     let
                         updated =
                             case field of
+                                "requireApproval" ->
+                                    { pf | requireApproval = value == "true" }
+
+                                "confirmDuplicate" ->
+                                    { pf | confirmDuplicate = value == "true" }
+
                                 "amount" ->
-                                    { pf | amount = value }
+                                    { pf | amount = value, confirmDuplicate = False }
 
                                 "paidOn" ->
-                                    { pf | paidOn = value }
+                                    { pf | paidOn = value, confirmDuplicate = False }
 
                                 "method" ->
-                                    { pf | method = value }
+                                    { pf | method = value, confirmDuplicate = False }
 
                                 "reference" ->
-                                    { pf | reference = value }
+                                    { pf | reference = value, confirmDuplicate = False }
 
                                 "notes" ->
                                     { pf | notes = value }
@@ -394,7 +400,7 @@ update msg model =
                         fresh =
                             { model
                                 | paymentForm = Nothing
-                                , toast = Just ("Recorded payment of " ++ String.fromFloat p.amount)
+                                , toast = Just ((if p.status == "pending_approval" then "Receipt awaiting manager approval: " else "Recorded payment of ") ++ String.fromFloat p.amount)
                             }
                     in
                     ( fresh, refreshPayments fresh )

@@ -486,8 +486,8 @@ leadStatusPills label current options toMsg isDisabled =
         ]
 
 
-leadFormView : LeadForm -> Bool -> Html Msg
-leadFormView lf isEdit =
+leadFormView : Model -> LeadForm -> Bool -> Html Msg
+leadFormView model lf isEdit =
     let
         formError =
             leadFormFieldError "form" lf
@@ -543,6 +543,16 @@ leadFormView lf isEdit =
                 ]
                 []
             ]
+        , node "crm-form-quality"
+            [ Attr.attribute "entity" "leads"
+            , Attr.attribute "name" lf.name
+            , Attr.attribute "email" lf.email
+            , Attr.attribute "phone" lf.phone
+            , Attr.attribute "followUpDate" lf.followUpDate
+            , Attr.attribute "status" lf.status
+            , Attr.attribute "record-id" (Maybe.withDefault "" model.editingLeadId)
+            ]
+            []
         , div [ class "modal__actions" ]
             [ button
                 [ type_ "button"
@@ -627,7 +637,7 @@ leadFormModal model lf =
                     ]
 
               else
-                leadFormView lf isEdit
+                leadFormView model lf isEdit
             ]
         ]
 

@@ -75,13 +75,13 @@ func validatePartner(req partnerRequest) map[string]string {
 	return fields
 }
 
-func listPartnersHandler(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listPartnersHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	ptype := strings.TrimSpace(r.URL.Query().Get("type"))
 	country := strings.TrimSpace(strings.ToUpper(r.URL.Query().Get("country")))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listPartners()
+	all := state.listPartners()
 	filtered := make([]Partner, 0, len(all))
 	for _, p := range all {
 		if ptype != "" && p.Type != ptype {
@@ -108,11 +108,17 @@ func listPartnersHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getPartnerHandler(w http.ResponseWriter, r *http.Request) {
+func listPartnersHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listPartnersHandler(w, r)
+}
+
+func (state *runtimeStore) getPartnerHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, p := range partners {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, p := range state.partners {
 		if p.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"partner": p})
 			return
@@ -121,7 +127,13 @@ func getPartnerHandler(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Partner not found")
 }
 
-func createPartnerHandler(w http.ResponseWriter, r *http.Request) {
+func getPartnerHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getPartnerHandler(w, r)
+}
+
+func (state *runtimeStore) createPartnerHandler(w http.ResponseWriter, r *http.Request) {
 	var req partnerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -136,7 +148,7 @@ func createPartnerHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
@@ -168,14 +180,20 @@ func createPartnerHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:           now,
 	}
 
-	mu.Lock()
-	partners = append(partners, newPartner)
-	mu.Unlock()
+	state.mu.Lock()
+	state.partners = append(state.partners, newPartner)
+	state.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"partner": newPartner})
 }
 
-func updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
+func createPartnerHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createPartnerHandler(w, r)
+}
+
+func (state *runtimeStore) updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req partnerRequest
@@ -189,11 +207,11 @@ func updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, p := range partners {
+	for i, p := range state.partners {
 		if p.ID == id {
 			idx = i
 			break
@@ -204,7 +222,7 @@ func updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := partners[idx]
+	updated := state.partners[idx]
 	updated.Type = strings.TrimSpace(req.Type)
 	updated.LegalCompanyName = strings.TrimSpace(req.LegalCompanyName)
 	updated.Country = strings.TrimSpace(strings.ToUpper(req.Country))
@@ -225,18 +243,24 @@ func updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
 	updated.ComplianceNotes = strings.TrimSpace(req.ComplianceNotes)
 	updated.Notes = req.Notes
 
-	partners[idx] = updated
+	state.partners[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"partner": updated})
 }
 
-func deletePartnerHandler(w http.ResponseWriter, r *http.Request) {
+func updatePartnerHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updatePartnerHandler(w, r)
+}
+
+func (state *runtimeStore) deletePartnerHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, p := range partners {
+	for i, p := range state.partners {
 		if p.ID == id {
 			idx = i
 			break
@@ -247,6 +271,12 @@ func deletePartnerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	partners = append(partners[:idx], partners[idx+1:]...)
+	state.partners = append(state.partners[:idx], state.partners[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deletePartnerHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deletePartnerHandler(w, r)
 }

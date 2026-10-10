@@ -597,6 +597,7 @@ studentDetailView model s =
                     ]
                 ]
             ]
+        , node "crm-student-journey" [ Attr.attribute "record-id" s.id ] []
         , div [ class "detail-stats" ]
             [ detailStat "Cases"
                 (String.fromInt (List.length dossierData.cases))
@@ -982,6 +983,15 @@ studentFormView model sf isEdit =
                 ]
                 []
             ]
+        , node "crm-form-quality"
+            [ Attr.attribute "entity" "students"
+            , Attr.attribute "name" sf.name
+            , Attr.attribute "studentCode" sf.studentCode
+            , Attr.attribute "schoolId" sf.schoolId
+            , Attr.attribute "program" sf.program
+            , Attr.attribute "record-id" (Maybe.withDefault "" model.editingStudentId)
+            ]
+            []
         , div [ class "modal__actions" ]
             [ button
                 [ type_ "button"

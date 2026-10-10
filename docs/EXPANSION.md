@@ -138,8 +138,9 @@ Jobs run outside the serialized CRM request handler. Only visible selected recor
 content and relevant visible document status are supplied. The request uses OpenAI
 Responses with `store: false`; input is removed from the local job after completion.
 A maximum of ten queued/processing jobs per organization limits backlog. Provider
-results are displayed for staff to review, edit and copy. AI never sends a message,
-marks a document verified or changes a CRM record. Drafts can be inaccurate and must
+results are displayed for staff to review, edit and copy. These draft/extraction job endpoints never send a message,
+mark a document verified or change a CRM record. The conversational agent below
+can propose explicit actions that require staff confirmation. Drafts can be inaccurate and must
 be checked against the source document. This is not a legal decision engine.
 
 The dashboard also includes **AI work brief**. It builds a deterministic worklist
@@ -261,18 +262,16 @@ python3 -m unittest discover -s tests -p '*_test.py'
 (cd golang-backend && go test -race ./... && go vet ./...)
 ```
 
-The new `/api/records/{entity}/{id}` and `/api/insights` GET handlers query committed
-SQL with explicit organization/visibility scope and avoid mutating the global cache.
-Scope indexes support that path. Existing handlers still rely on the serialized
-projection/cache. The SQLite connection pool remains one connection, so transaction
-ordering stays safe with legacy workers. This is a migration path, not completed
-multi-process scaling. A `BenchmarkRecordReads` benchmark compares the SQL and legacy paths against
-5,000 additional contacts (`go test -run '^$' -bench BenchmarkRecordReads -benchmem`).
-No throughput claim is made until that benchmark is run in the deployment environment.
-Moving the remaining handlers to SQL repositories, adding
-SQL aggregate queries for large datasets, load tests, and a database/server migration
-remain necessary for larger deployments. Provider credentials and external provider
-acceptance tests are required before live integration use.
+Standard module list/detail reads, reports, daily work, student journeys and audit
+history now use scoped committed SQL. Normal CRM writes and follow-up automation
+persist guarded row changes rather than synchronizing every module. See
+[Daily work → SQL transition and limits](DAILY_WORK.md#sql-transition-and-limits).
+Validators and workers now use private state loaded from committed SQL, without
+publishing runtime changes into the bootstrap cache. Separate-process tests cover
+startup, concurrent writes, stale edits, account changes and recurring workers.
+Each process has one SQLite connection; writers remain serialized. Large writes
+still load a workspace projection, so larger deployments require measured load
+and live provider acceptance. See [integration acceptance](INTEGRATION_ACCEPTANCE.md).
 
 For Compose deployments, `scripts/backup-compose.sh /private/backups` automates
 stopping the service, archiving the data volume, and restarting it even if backup
@@ -294,23 +293,35 @@ not been run. No live AI, Microsoft Graph, SMTP or WhatsApp credentials were use
 
 ## Conversational AI adviser
 
-**Ask ECC AI** is available on every signed-in workspace page. Ask follow-up
-questions, request advice on the record being viewed, plan the day or draft a
-client response. The dashboard places the daily AI work brief ahead of statistics.
+The AI backend supports record context, permission-scoped CRM search/read tools,
+knowledge-library retrieval, reports, saved per-user conversation threads, optional
+proactive advice and optional realtime voice sessions. Configure `OPENAI_API_KEY`
+and `OPENAI_MODEL`, then enable AI for the organization. Administrators can control
+record context, knowledge, reports, actions, proactive advice, voice and usage/budget
+limits under the assistant administration API. The default workspace activation
+remains disabled; feature settings are separate from provider credentials.
 
-Configure `OPENAI_API_KEY` and `OPENAI_MODEL`, restart the backend, then enable
-AI in **Workspace tools → Integrations** as an administrator. Chat uses the
-existing Responses API integration with `store: false`. Each turn includes the
-current permitted record (if selected) and up to 30 priority work items assigned
-to the user or unassigned. This is a limited context, not a workspace-wide search.
-Conversation history stays in component memory and is cleared by New chat,
-changing record context, or leaving the authenticated application. The last nine
-exchanges are supplied on follow-up turns; messages have bounded sizes.
+Requests use Responses with `store: false`, while conversation threads and messages
+are stored locally in SQLite for the owning user. Access to source records is
+rechecked when loading history or returning a response; revoked/changed sources
+can cause redaction or a retry. The priority context is capped at 30 items; enabled
+read tools can search beyond that worklist. Knowledge entries have workspace,
+owner/team/visibility scope, linked-record access checks and revision guards.
+Viewers can read allowed sources but cannot change the knowledge library.
 
-Microphone input appears when the browser supports speech recognition; users
-review the transcription before sending. Browser speech services may process
-audio. Read replies aloud uses browser speech synthesis when available. This is
-turn-based voice assistance, not a realtime audio session. The adviser offers
-recommendations and drafts; it has no record-editing or message-sending tools.
-Provider failures leave the question available to retry. Chat does not store
-transcripts in the database or AI job history.
+When actions and record context are enabled, the agent may propose a task, an
+allowlisted record update, a follow-up, queued email or a meeting. **Proposing an
+action does not execute it.** The owning staff member must confirm using
+`POST /api/assistant/actions/{action}/confirm`, or cancel it using the reject route.
+Confirmation rechecks workspace/user ownership, role, current edit permissions,
+settings, expiry and record revision, and reuses the normal mutation validators.
+Viewers cannot propose or confirm actions. Stale proposals require a fresh proposal.
+Email confirmation queues delivery through the existing SMTP outbox.
+
+The global **Ask ECC AI** component supports saved conversations, source links,
+review of proposed field changes, explicit confirmation and cancellation. It is
+separate from the daily AI brief and record draft forms. Knowledge management and
+advanced administration are available through their permission-scoped APIs. Realtime voice is optional
+and requires its own model/configuration. Browser transcription/synthesis support
+and realtime voice are distinct capabilities. No live provider acceptance is
+implied by endpoint or mocked permission tests.

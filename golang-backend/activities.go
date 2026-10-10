@@ -60,14 +60,14 @@ func normalizeDate(s string) string {
 	return s
 }
 
-func listActivities(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listActivities(w http.ResponseWriter, r *http.Request) {
 	contactID := r.PathValue("id")
 
-	mu.RLock()
-	defer mu.RUnlock()
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 
 	found := false
-	for _, c := range contacts {
+	for _, c := range state.contacts {
 		if c.ID == contactID {
 			found = true
 			break
@@ -79,7 +79,7 @@ func listActivities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filtered := make([]Activity, 0)
-	for _, a := range activities {
+	for _, a := range state.activities {
 		if a.ContactID == contactID {
 			filtered = append(filtered, a)
 		}
@@ -94,7 +94,13 @@ func listActivities(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func createActivity(w http.ResponseWriter, r *http.Request) {
+func listActivities(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listActivities(w, r)
+}
+
+func (state *runtimeStore) createActivity(w http.ResponseWriter, r *http.Request) {
 	contactID := r.PathValue("id")
 
 	var req activityRequest
@@ -103,11 +109,11 @@ func createActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	contactIdx := -1
-	for i, c := range contacts {
+	for i, c := range state.contacts {
 		if c.ID == contactID {
 			contactIdx = i
 			break
@@ -126,7 +132,7 @@ func createActivity(w http.ResponseWriter, r *http.Request) {
 	dealID := strings.TrimSpace(req.DealID)
 	if dealID != "" {
 		ok := false
-		for _, d := range deals {
+		for _, d := range state.deals {
 			if d.ID == dealID {
 				ok = true
 				break
@@ -153,31 +159,37 @@ func createActivity(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:   "Demo User",
 		CreatedAt:   now,
 	}
-	activities = append(activities, newActivity)
-	for i := range contacts {
-		if contacts[i].ID == contactID && contacts[i].LastContact < occurredAt {
-			contacts[i].LastContact = occurredAt
+	state.activities = append(state.activities, newActivity)
+	for i := range state.contacts {
+		if state.contacts[i].ID == contactID && state.contacts[i].LastContact < occurredAt {
+			state.contacts[i].LastContact = occurredAt
 		}
 	}
 
-	if occurredAt > contacts[contactIdx].LastContact {
-		contacts[contactIdx].LastContact = occurredAt
+	if occurredAt > state.contacts[contactIdx].LastContact {
+		state.contacts[contactIdx].LastContact = occurredAt
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"activity": newActivity,
-		"contact":  contacts[contactIdx],
+		"contact":  state.contacts[contactIdx],
 	})
 }
 
-func deleteActivity(w http.ResponseWriter, r *http.Request) {
+func createActivity(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createActivity(w, r)
+}
+
+func (state *runtimeStore) deleteActivity(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, a := range activities {
+	for i, a := range state.activities {
 		if a.ID == id {
 			idx = i
 			break
@@ -188,6 +200,12 @@ func deleteActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activities = append(activities[:idx], activities[idx+1:]...)
+	state.activities = append(state.activities[:idx], state.activities[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteActivity(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteActivity(w, r)
 }

@@ -2,9 +2,10 @@
   "name": "ecc-crm-verification",
   "private": true,
   "scripts": {
-    "test": "node --test --test-isolation=none tests/dom.test.cjs tests/administration.test.cjs tests/mobile.test.cjs",
-    "test:live": "ECC_BROWSER_LIVE=true node --test --test-isolation=none tests/browser.test.cjs",
-    "test:browser": "node --test --test-isolation=none tests/browser.test.cjs"
+    "test": "node --test tests/dom.test.cjs tests/administration.test.cjs tests/mobile.test.cjs",
+    "test:live": "ECC_BROWSER_LIVE=true node --test tests/browser.test.cjs tests/journey.browser.cjs",
+    "test:browser": "node --test tests/browser.test.cjs tests/journey.browser.cjs",
+    "test:integrations": "node tests/live-integrations.cjs"
   },
   "devDependencies": {
     "puppeteer": "25.10.0",

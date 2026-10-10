@@ -930,7 +930,11 @@ caseToForm c =
     , actualSubmission = c.actualSubmission
     , governmentRef = c.governmentRef
     , currentStage = c.currentStage
-    , priority = c.priority
+    , priority =
+        if c.priority == "Normal" then
+            "Medium"
+        else
+            c.priority
     , nextAction = c.nextAction
     , nextDeadline = c.nextDeadline
     , result = c.result
@@ -1208,11 +1212,15 @@ type alias Payment =
     , notes : String
     , createdBy : String
     , createdAt : String
+    , status : String
+    , reviewedBy : String
     }
 
 
 type alias PaymentForm =
-    { amount : String
+    { requireApproval : Bool
+    , confirmDuplicate : Bool
+    , amount : String
     , paidOn : String
     , method : String
     , reference : String
@@ -1224,7 +1232,9 @@ type alias PaymentForm =
 
 emptyPaymentForm : PaymentForm
 emptyPaymentForm =
-    { amount = ""
+    { requireApproval = False
+    , confirmDuplicate = False
+    , amount = ""
     , paidOn = ""
     , method = ""
     , reference = ""

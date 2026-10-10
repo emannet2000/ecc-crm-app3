@@ -48,9 +48,9 @@ test('record version headers stay tied to the form snapshot during background re
   open(method,url){this.method=method;this.url=url}
   setRequestHeader(key,value){this.headers[key]=value}
   addEventListener(key,callback){this.listeners[key]=callback}
-  send(){this.responseText=JSON.stringify({contact:{id:'client',_revision:version}});this.listeners.load?.()}
+  send(){this.responseText=JSON.stringify({contact:{id:'client',_revision:version}});this.readyState=4;this.listeners.readystatechange?.();this.listeners.load?.()}
  }
- const context=vm.createContext({window,document:window.document,location:{href:'http://crm.test/',origin:'http://crm.test'},URL,XMLHttpRequest:FakeXHR,MutationObserver:window.MutationObserver,Map,JSON});
+ const context=vm.createContext({window,document:window.document,location:{href:'http://crm.test/',origin:'http://crm.test'},URL,CustomEvent:window.CustomEvent,XMLHttpRequest:FakeXHR,MutationObserver:window.MutationObserver,Map,JSON});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../public/record-versions.js'),'utf8'),context);
  const get=()=>{const request=new FakeXHR();request.open('GET','/api/contacts/client');request.send()};
  get();const dialog=window.document.createElement('div');dialog.className='modal-panel';window.document.body.append(dialog);await new Promise(resolve=>setTimeout(resolve,0));

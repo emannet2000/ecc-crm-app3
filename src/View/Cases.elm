@@ -7,6 +7,7 @@ import Html exposing (..)
 import Html.Attributes as Attr exposing (checked, class, disabled, for, id, placeholder, type_, value)
 import Html.Events exposing (onClick, onInput, onSubmit)
 import Json.Decode as D
+import View.RecordPicker as RecordPicker
 import Types exposing (..)
 import View.Dashboard exposing (ActivityEntry, PriorityAlert, activityPanel, alertsPanel, documentCorrectionAlert, documentEntry, expiredDocumentAlert, urgentCaseAlert)
 import View.Helpers exposing (detailCard, detailEmpty, detailStat, infoRow, initials, onCheck, paginationBar, svgIcon, svgPath)
@@ -445,6 +446,8 @@ caseDetailView model c =
                     ]
                 ]
             ]
+        , node "crm-application-blockers" [ Attr.attribute "record-id" c.id ] []
+        , node "crm-case-handoff" [ Attr.attribute "record-id" c.id, id "handoff" ] []
         , div [ class "detail-stats" ]
             [ detailStat "Destination" (display c.destinationCountry) "Country"
             , detailStat "Visa type" (display c.visaType) "Category"
@@ -629,84 +632,24 @@ caseRichField cf fieldId labelText inputType =
 
 
 caseStudentSelect : Model -> CaseForm -> Html Msg
-caseStudentSelect model cf =
-    let
-        opts =
-            case model.students of
-                Success d ->
-                    List.sortBy .name d.items
-
-                _ ->
-                    []
-    in
+caseStudentSelect _ cf =
     div [ class "ecc-field" ]
-        [ select
-            [ id "cf-studentId"
-            , onInput (UpdatedCaseFormField "studentId")
-            , disabled cf.submitting
-            ]
-            (option [ value "", Attr.selected (cf.studentId == "") ]
-                [ text "No student linked" ]
-                :: List.map
-                    (\s ->
-                        option
-                            [ value s.id, Attr.selected (cf.studentId == s.id) ]
-                            [ text s.name ]
-                    )
-                    opts
-            )
-        , label [ for "cf-studentId" ] [ text "Student" ]
+        [ span [ class "ecc-field__label" ] [ text "Student" ]
+        , RecordPicker.view "cf-studentId" "students" cf.studentId "Find student" cf.submitting (UpdatedCaseFormField "studentId")
         ]
 
 
 caseClientSelect : Model -> CaseForm -> Html Msg
-caseClientSelect model cf =
-    let
-        opts =
-            case model.contacts of
-                Success d ->
-                    List.sortBy .name d.items
-
-                _ ->
-                    []
-
-        err =
-            caseFormFieldError "clientId" cf
-
-        cls =
-            case err of
-                Just _ ->
-                    "ecc-field ecc-field--error"
-
-                Nothing ->
-                    "ecc-field"
-    in
-    div [ class cls ]
-        ([ select
-            [ id "cf-clientId"
-            , onInput (UpdatedCaseFormField "clientId")
-            , disabled cf.submitting
-            ]
-            (option [ value "", Attr.selected (cf.clientId == "") ]
-                [ text "No contact linked" ]
-                :: List.map
-                    (\c ->
-                        option
-                            [ value c.id, Attr.selected (cf.clientId == c.id) ]
-                            [ text c.name ]
-                    )
-                    opts
-            )
-         , label [ for "cf-clientId" ] [ text "Contact" ]
-         ]
-            ++ (case err of
-                    Just msg ->
-                        [ p [ class "ecc-field__message" ] [ text msg ] ]
-
-                    Nothing ->
-                        []
-               )
-        )
+caseClientSelect _ cf =
+    div [ class "ecc-field" ]
+        [ span [ class "ecc-field__label" ] [ text "Contact" ]
+        , RecordPicker.view "cf-clientId" "contacts" cf.clientId "Find contact" cf.submitting (UpdatedCaseFormField "clientId")
+        , case caseFormFieldError "clientId" cf of
+            Just message ->
+                p [ class "ecc-field__message" ] [ text message ]
+            Nothing ->
+                text ""
+        ]
 
 
 caseStagePills : CaseForm -> Html Msg
@@ -817,6 +760,16 @@ caseFormView model cf isEdit =
                 ]
                 []
             ]
+        , node "crm-form-quality"
+            [ Attr.attribute "entity" "cases"
+            , Attr.attribute "studentId" cf.studentId
+            , Attr.attribute "clientId" cf.clientId
+            , Attr.attribute "nextAction" cf.nextAction
+            , Attr.attribute "nextDeadline" cf.nextDeadline
+            , Attr.attribute "currentStage" cf.currentStage
+            , Attr.attribute "record-id" (Maybe.withDefault "" model.editingCaseId)
+            ]
+            []
         , div [ class "modal__actions" ]
             [ button
                 [ type_ "button"

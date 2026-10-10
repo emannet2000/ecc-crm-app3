@@ -171,7 +171,9 @@ tabs, saved views, and mobile layouts.
 
 Provider credentials were not supplied. SMTP, Stripe, push and SAML should be
 validated against their real providers before production activation. The app
-continues to use one backend process per SQLite database. Back up the database
+now verifies shared-database operation with separate-process regression tests;
+SQLite writers remain serialized and large writes remain expensive. See
+[SQL runtime verification](DAILY_WORK.md#sql-transition-and-limits). Back up the database
 using SQLite's backup API, plus the private uploads directory and encryption secret.
 Protect the demo administrator account and disable public signup for a private
 production workspace.

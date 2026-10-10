@@ -16,9 +16,11 @@ import (
 
 // These routes read committed SQL data without replacing the shared CRM cache.
 func independentRead(r *http.Request) bool {
-	return independentAI(r) || r.Method == "GET" && (strings.HasPrefix(r.URL.Path, "/api/records/") || r.URL.Path == "/api/insights" || r.URL.Path == "/api/health")
+	_, _, repository := repositoryRoute(r)
+	return repository || r.Method == "GET" && (r.URL.Path == "/api/reports" || r.URL.Path == "/api/audit") || independentDailyRead(r) || independentAI(r) || r.Method == "GET" && (strings.HasPrefix(r.URL.Path, "/api/records/") || r.URL.Path == "/api/insights" || r.URL.Path == "/api/health")
 }
 func registerExpansionRoutes(m *http.ServeMux) {
+	registerDailyRoutes(m)
 	m.HandleFunc("GET /api/records/{entity}/{id}", authMiddleware(handleSQLRecord))
 	m.HandleFunc("GET /api/insights", authMiddleware(handleInsights))
 	m.HandleFunc("GET /api/trash", authMiddleware(handleTrash))
@@ -30,6 +32,7 @@ func registerExpansionRoutes(m *http.ServeMux) {
 }
 func migrateExpansion(tx *sql.Tx) error {
 	statements := []string{
+		`CREATE INDEX IF NOT EXISTS contacts_org_email ON contacts(json_extract(data,'$.orgId'),lower(json_extract(data,'$.email')))`,
 		`CREATE TABLE IF NOT EXISTS trash_batches(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,actor TEXT NOT NULL,label TEXT NOT NULL,data TEXT NOT NULL,deleted_at TEXT NOT NULL,restored_at TEXT)`,
 		`CREATE INDEX IF NOT EXISTS trash_org ON trash_batches(org_id,deleted_at)`,
 		`CREATE TABLE IF NOT EXISTS portal_access(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,student_id TEXT NOT NULL,contact_id TEXT NOT NULL,email TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,revoked_at TEXT,activated_at TEXT)`,
@@ -280,7 +283,7 @@ func replaceSavedRecord(saved *diskStore, entity, id, payload string) error {
 	field.Set(reflect.Append(field, item.Elem()))
 	return nil
 }
-func handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -295,7 +298,7 @@ func handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "Invalid archive")
 		return
 	}
-	saved := cloneStore()
+	saved := state.cloneStore()
 	current := recordsOf(saved)
 	for _, c := range changes {
 		if current[c.Entity][c.ID] != c.After {
@@ -322,8 +325,14 @@ func handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "Could not restore archive")
 		return
 	}
-	restoreStore(saved)
+	state.restoreStore(saved)
 	writeJSON(w, 200, statusResponse{"restored"})
+}
+
+func handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRestoreTrash(w, r)
 }
 func validRestoredRelations(s diskStore, changes []trashChange) bool {
 	records := recordsOf(s)
@@ -347,6 +356,18 @@ func committedUser(r *http.Request, column, key string) (User, bool) {
 		return User{}, false
 	}
 	var u User
-	err := storeDB(r).QueryRow("SELECT id,email,name,session_version,org_id,team_id,role,disabled,two_factor_enabled FROM users WHERE "+column+"=?", key).Scan(&u.ID, &u.Email, &u.Name, &u.SessionVersion, &u.OrgID, &u.TeamID, &u.Role, &u.Disabled, &u.TwoFactorEnabled)
+	var raw string
+	err := storeDB(r).QueryRow("SELECT id,email,name,password_hash,session_version,org_id,team_id,role,disabled,two_factor_enabled,auth_data FROM users WHERE "+column+"=?", key).Scan(&u.ID, &u.Email, &u.Name, &u.Password, &u.SessionVersion, &u.OrgID, &u.TeamID, &u.Role, &u.Disabled, &u.TwoFactorEnabled, &raw)
+	var private struct {
+		LastTOTPStep   int64
+		TOTPSecret     string
+		RecoveryHashes []string
+	}
+	if err == nil {
+		err = json.Unmarshal([]byte(raw), &private)
+		u.LastTOTPStep = private.LastTOTPStep
+		u.TOTPSecret = private.TOTPSecret
+		u.RecoveryHashes = private.RecoveryHashes
+	}
 	return u, err == nil
 }

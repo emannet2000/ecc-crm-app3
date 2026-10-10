@@ -31,7 +31,7 @@ func isValidTaskStatus(s string) bool {
 	return false
 }
 
-func validateTask(req taskRequest) map[string]string {
+func (state *runtimeStore) validateTask(req taskRequest) map[string]string {
 	fields := map[string]string{}
 	title := strings.TrimSpace(req.Title)
 	status := strings.TrimSpace(req.Status)
@@ -45,21 +45,27 @@ func validateTask(req taskRequest) map[string]string {
 		fields["status"] = "Invalid status"
 	}
 	if contactID != "" {
-		if _, ok := findContactByID(contactID); !ok {
+		if _, ok := state.findContactByID(contactID); !ok {
 			fields["contactId"] = "Contact not found"
 		}
 	}
 	return fields
 }
 
-func listTasks(w http.ResponseWriter, r *http.Request) {
+func validateTask(req taskRequest) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateTask(req)
+}
+
+func (state *runtimeStore) listTasks(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
 	limit, offset := parseLimitOffset(r, 50, 0)
-	mu.RLock()
-	defer mu.RUnlock()
-	filtered := make([]Task, 0, len(tasks))
-	for _, t := range tasks {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	filtered := make([]Task, 0, len(state.tasks))
+	for _, t := range state.tasks {
 		if statusFilter != "" && t.Status != statusFilter {
 			continue
 		}
@@ -78,11 +84,17 @@ func listTasks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getTask(w http.ResponseWriter, r *http.Request) {
+func listTasks(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listTasks(w, r)
+}
+
+func (state *runtimeStore) getTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, t := range tasks {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, t := range state.tasks {
 		if t.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"task": t})
 			return
@@ -91,15 +103,21 @@ func getTask(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Task not found")
 }
 
-func createTask(w http.ResponseWriter, r *http.Request) {
+func getTask(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getTask(w, r)
+}
+
+func (state *runtimeStore) createTask(w http.ResponseWriter, r *http.Request) {
 	var req taskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if fields := validateTask(req); len(fields) > 0 {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if fields := state.validateTask(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -110,7 +128,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 	contactID := strings.TrimSpace(req.ContactID)
 	contactName := ""
 	if contactID != "" {
-		if c, ok := findContactByID(contactID); ok {
+		if c, ok := state.findContactByID(contactID); ok {
 			contactName = c.Name
 		}
 	}
@@ -122,16 +140,22 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		ContactID: contactID, ContactName: contactName,
 		Owner: strings.TrimSpace(req.Owner), CreatedAt: now,
 	}
-	tasks = append(tasks, newTask)
+	state.tasks = append(state.tasks, newTask)
 	writeJSON(w, http.StatusCreated, map[string]any{"task": newTask})
 }
 
-func updateTask(w http.ResponseWriter, r *http.Request) {
+func createTask(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createTask(w, r)
+}
+
+func (state *runtimeStore) updateTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	idx := -1
-	for i, t := range tasks {
+	for i, t := range state.tasks {
 		if t.ID == id {
 			idx = i
 			break
@@ -146,18 +170,18 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if fields := validateTask(req); len(fields) > 0 {
+	if fields := state.validateTask(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
 	contactID := strings.TrimSpace(req.ContactID)
 	contactName := ""
 	if contactID != "" {
-		if c, ok := findContactByID(contactID); ok {
+		if c, ok := state.findContactByID(contactID); ok {
 			contactName = c.Name
 		}
 	}
-	updated := tasks[idx]
+	updated := state.tasks[idx]
 	updated.Title = strings.TrimSpace(req.Title)
 	updated.Description = req.Description
 	updated.DueDate = strings.TrimSpace(req.DueDate)
@@ -167,16 +191,22 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 	if status := strings.TrimSpace(req.Status); status != "" {
 		updated.Status = status
 	}
-	tasks[idx] = updated
+	state.tasks[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"task": updated})
 }
 
-func updateTaskStatus(w http.ResponseWriter, r *http.Request) {
+func updateTask(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateTask(w, r)
+}
+
+func (state *runtimeStore) updateTaskStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	idx := -1
-	for i, t := range tasks {
+	for i, t := range state.tasks {
 		if t.ID == id {
 			idx = i
 			break
@@ -196,16 +226,22 @@ func updateTaskStatus(w http.ResponseWriter, r *http.Request) {
 		writeFieldErrors(w, map[string]string{"status": "Invalid status"})
 		return
 	}
-	tasks[idx].Status = status
-	writeJSON(w, http.StatusOK, map[string]any{"task": tasks[idx]})
+	state.tasks[idx].Status = status
+	writeJSON(w, http.StatusOK, map[string]any{"task": state.tasks[idx]})
 }
 
-func deleteTask(w http.ResponseWriter, r *http.Request) {
+func updateTaskStatus(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateTaskStatus(w, r)
+}
+
+func (state *runtimeStore) deleteTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	idx := -1
-	for i, t := range tasks {
+	for i, t := range state.tasks {
 		if t.ID == id {
 			idx = i
 			break
@@ -215,6 +251,12 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Task not found")
 		return
 	}
-	tasks = append(tasks[:idx], tasks[idx+1:]...)
+	state.tasks = append(state.tasks[:idx], state.tasks[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteTask(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteTask(w, r)
 }

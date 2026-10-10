@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,11 +20,13 @@ func setupStore(t *testing.T) {
 		if database != nil {
 			database.Close()
 			database = nil
+			fixtureBaseline = diskStore{}
 		}
 	})
 	if err := loadStore(filepath.Join(t.TempDir(), "crm.sqlite3")); err != nil {
 		t.Fatal(err)
 	}
+	fixtureBaseline = cloneStore()
 }
 
 func TestPersistenceRoundTrip(t *testing.T) {
@@ -68,7 +72,10 @@ func TestCorruptStoreIsNotOverwritten(t *testing.T) {
 func TestReportsUseAllRecords(t *testing.T) {
 	setupStore(t)
 	response := httptest.NewRecorder()
-	handleReports(response, httptest.NewRequest("GET", "/api/reports", nil))
+	user, _ := findUserByEmail("demo@northwind.dev")
+	request := aiUserRequest(context.Background(), user)
+	request.URL = &url.URL{Path: "/api/reports"}
+	handleReports(response, request)
 	var report reportSummary
 	json.Unmarshal(response.Body.Bytes(), &report)
 	if report.Contacts != len(contacts) || report.OpenTasks != 5 || report.OutstandingBalance != 2235 {

@@ -28,7 +28,7 @@ func adminVersionRequest(h http.Handler, method, path string, data any, cookies 
 		r.AddCookie(cookie)
 	}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	return w
 }
 
@@ -104,7 +104,7 @@ func TestAdminAccessChangesRevokeSessionsAndRejectStaleEdits(t *testing.T) {
 	r := httptest.NewRequest("GET", "/api/me", nil)
 	r.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	assertStatus(t, w, 401)
 	assertStatus(t, adminVersionRequest(h, "PATCH", path, map[string]string{"role": "admin"}, admin, version), 409)
 	assertStatus(t, adminVersionRequest(h, "PATCH", path, map[string]string{"role": "superadmin"}, admin, userAccessVersion(updated)), 400)
@@ -227,7 +227,7 @@ func TestAccessLevelsEnforceRecordVisibilityAndOwnership(t *testing.T) {
 					r.Header.Set("Authorization", "Bearer "+token)
 					r.Header.Set("Content-Type", "application/json")
 					w := httptest.NewRecorder()
-					h.ServeHTTP(w, r)
+					serveFixtureRequest(h, w, r)
 					return w
 				}
 				readStatus := 200

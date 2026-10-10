@@ -29,7 +29,7 @@ func queueMail(r *http.Request, user User, kind, recipient, subject, body, conta
 	_, err := storeDB(r).Exec(`INSERT INTO mail_outbox(id,org_id,user_id,contact_id,invoice_id,kind,recipient,subject,body,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)`, newID("mail"), user.OrgID, user.ID, contactID, invoiceID, kind, recipient, subject, body, utcNow())
 	return err
 }
-func handleComposeMail(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleComposeMail(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	var req struct{ Recipient, Subject, Body, ContactID string }
 	if !decodeRequest(w, r, &req) {
@@ -42,15 +42,15 @@ func handleComposeMail(w http.ResponseWriter, r *http.Request) {
 	var contact Contact
 	if req.ContactID != "" {
 		found := false
-		mu.RLock()
-		for _, candidate := range contacts {
+		state.mu.RLock()
+		for _, candidate := range state.contacts {
 			if candidate.ID == req.ContactID {
 				contact = candidate
 				found = true
 				break
 			}
 		}
-		mu.RUnlock()
+		state.mu.RUnlock()
 		if !found {
 			writeError(w, 404, "Contact not found")
 			return
@@ -68,16 +68,22 @@ func handleComposeMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.ContactID != "" {
-		mu.Lock()
-		activities = append(activities, Activity{RecordScope: newRecordScope(r), ID: newID("a"), ContactID: req.ContactID, Kind: "email", Title: req.Subject, Body: "Email queued to " + req.Recipient + "\n\n" + req.Body, OccurredAt: utcNow(), CreatedBy: user.Name, CreatedAt: utcNow()})
-		for i := range contacts {
-			if contacts[i].ID == req.ContactID {
-				contacts[i].LastContact = organizationToday(r)
+		state.mu.Lock()
+		state.activities = append(state.activities, Activity{RecordScope: newRecordScope(r), ID: newID("a"), ContactID: req.ContactID, Kind: "email", Title: req.Subject, Body: "Email queued to " + req.Recipient + "\n\n" + req.Body, OccurredAt: utcNow(), CreatedBy: user.Name, CreatedAt: utcNow()})
+		for i := range state.contacts {
+			if state.contacts[i].ID == req.ContactID {
+				state.contacts[i].LastContact = organizationToday(r)
 			}
 		}
-		mu.Unlock()
+		state.mu.Unlock()
 	}
 	writeJSON(w, 202, map[string]string{"message": "Email queued. Delivery status is shown in the outbox."})
+}
+
+func handleComposeMail(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleComposeMail(w, r)
 }
 func handleRetryMail(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
@@ -107,10 +113,10 @@ func handleReadNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, statusResponse{"ok"})
 }
-func queueChangeEvents(r *http.Request, events []AuditEvent) error {
+func (state *runtimeStore) queueChangeEvents(r *http.Request, events []AuditEvent) error {
 	for _, event := range events {
 		payload, _ := json.Marshal(event)
-		owner, _ := findUserByID(event.Scope.OwnerID)
+		owner, _ := state.findUserByID(event.Scope.OwnerID)
 		if event.Scope.OwnerID != "" && owner.Email != event.Actor {
 			if _, err := storeDB(r).Exec("INSERT OR IGNORE INTO notifications VALUES(?,?,?,?,?,?,?,?,?,NULL)", newID("notice"), event.OrgID, event.Scope.OwnerID, "record", event.Label+" "+event.Action, "Changed by "+event.Actor, "/"+event.Entity+"/"+event.RecordID, newID("event"), utcNow()); err != nil {
 				return err
@@ -127,6 +133,12 @@ func queueChangeEvents(r *http.Request, events []AuditEvent) error {
 		}
 	}
 	return nil
+}
+
+func queueChangeEvents(r *http.Request, events []AuditEvent) error {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	return state.queueChangeEvents(r, events)
 }
 func organizationToday(r *http.Request) string {
 	var zone string
@@ -277,6 +289,7 @@ func startWorkers(ctx context.Context) func() {
 	return workers.Wait
 }
 func deliverMailOutbox() {
+	database.Exec("UPDATE mail_outbox SET status='delivery_unknown',last_error='Delivery was interrupted; verify with the provider before retrying' WHERE status='sending' AND next_attempt<=?", utcNow())
 	rows, err := database.Query(`SELECT id,org_id,recipient,subject,body,invoice_id,attempts FROM mail_outbox WHERE status IN ('queued','waiting_configuration') AND (next_attempt='' OR next_attempt<=?) ORDER BY created_at LIMIT 10`, utcNow())
 	if err != nil {
 		return
@@ -294,6 +307,9 @@ func deliverMailOutbox() {
 	}
 	rows.Close()
 	for _, job := range jobs {
+		if !claimDelivery("mail_outbox", job.id) {
+			continue
+		}
 		config := smtpConfiguration(job.org)
 		if config.Host == "" {
 			database.Exec("UPDATE mail_outbox SET status='waiting_configuration',last_error='Configure SMTP delivery' WHERE id=?", job.id)

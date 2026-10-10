@@ -26,16 +26,22 @@ func registerConversationRoutes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/inbound/unmatched/{message}/link", authMiddleware(handleLinkMessage))
 	m.HandleFunc("GET /api/mail/sync-status", authMiddleware(handleMailboxStatus))
 }
-func conversationContact(r *http.Request, id string) (Contact, bool) {
-	for _, c := range snapshot().Contacts {
+func (state *runtimeStore) conversationContact(r *http.Request, id string) (Contact, bool) {
+	for _, c := range state.snapshot().Contacts {
 		if c.ID == id && canRead(c.RecordScope, currentUser(r)) {
 			return c, true
 		}
 	}
 	return Contact{}, false
 }
-func handleConversations(w http.ResponseWriter, r *http.Request) {
-	if _, ok := conversationContact(r, r.PathValue("id")); !ok {
+
+func conversationContact(r *http.Request, id string) (Contact, bool) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	return state.conversationContact(r, id)
+}
+func (state *runtimeStore) handleConversations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := state.conversationContact(r, r.PathValue("id")); !ok {
 		writeError(w, 404, "Contact not found")
 		return
 	}
@@ -48,11 +54,17 @@ func handleConversations(w http.ResponseWriter, r *http.Request) {
 	safe := []map[string]any{}
 	for _, m := range rows {
 		caseID := fmtString(m["caseId"])
-		if caseID == "" || visibleRecordID(snapshot(), caseID) {
+		if caseID == "" || visibleRecordID(state.snapshot(), caseID) {
 			safe = append(safe, m)
 		}
 	}
 	writeJSON(w, 200, map[string]any{"messages": safe})
+}
+
+func handleConversations(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleConversations(w, r)
 }
 
 type inboundMessage struct {
@@ -65,9 +77,9 @@ type inboundMessage struct {
 	OccurredAt string `json:"occurredAt"`
 }
 
-func findInboundContact(org, channel, sender string) (Contact, bool) {
+func (state *runtimeStore) findInboundContact(org, channel, sender string) (Contact, bool) {
 	matches := []Contact{}
-	for _, c := range snapshot().Contacts {
+	for _, c := range state.snapshot().Contacts {
 		if c.OrgID != org {
 			continue
 		}
@@ -80,7 +92,13 @@ func findInboundContact(org, channel, sender string) (Contact, bool) {
 	}
 	return matches[0], true
 }
-func attachInbound(r *http.Request, channel string, m inboundMessage) error {
+
+func findInboundContact(org, channel, sender string) (Contact, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.findInboundContact(org, channel, sender)
+}
+func (state *runtimeStore) attachInbound(r *http.Request, channel string, m inboundMessage) error {
 	if m.ID == "" || len(m.ID) > 500 || m.OrgID == "" || len(m.Subject) > 200 || len(m.Body) > 100000 || len(m.From) > 300 {
 		return fmt.Errorf("invalid inbound message")
 	}
@@ -96,12 +114,12 @@ func attachInbound(r *http.Request, channel string, m inboundMessage) error {
 		}
 		at = parsed.UTC().Format(time.RFC3339)
 	}
-	c, matched := findInboundContact(m.OrgID, channel, m.From)
+	c, matched := state.findInboundContact(m.OrgID, channel, m.From)
 	caseID := ""
 	scope := c.RecordScope
 	if matched {
 		matchingCases := []Case{}
-		for _, candidate := range snapshot().Cases {
+		for _, candidate := range state.snapshot().Cases {
 			if candidate.OrgID == m.OrgID && candidate.ClientID == c.ID && ((m.CaseNumber != "" && candidate.CaseNumber == m.CaseNumber) || (m.CaseNumber == "" && subjectCaseReference(m.Subject, candidate.CaseNumber))) {
 				matchingCases = append(matchingCases, candidate)
 			}
@@ -132,15 +150,21 @@ func attachInbound(r *http.Request, channel string, m inboundMessage) error {
 		if activityKind != "whatsapp" {
 			activityKind = "email"
 		}
-		mu.Lock()
-		activities = append(activities, Activity{RecordScope: scope, ID: newID("a"), ContactID: c.ID, Kind: activityKind, Title: "Incoming " + channel + " · " + m.Subject, Body: m.Body, CreatedBy: m.From, OccurredAt: at, CreatedAt: utcNow()})
-		mu.Unlock()
+		state.mu.Lock()
+		state.activities = append(state.activities, Activity{RecordScope: scope, ID: newID("a"), ContactID: c.ID, Kind: activityKind, Title: "Incoming " + channel + " · " + m.Subject, Body: m.Body, CreatedBy: m.From, OccurredAt: at, CreatedAt: utcNow()})
+		state.mu.Unlock()
 	}
 	if meta := metadata(r); meta != nil {
 		meta.OrgID = m.OrgID
 		meta.Actor = "inbound:" + channel
 	}
 	return nil
+}
+
+func attachInbound(r *http.Request, channel string, m inboundMessage) error {
+	state, release := runtimeForCall(r)
+	defer release()
+	return state.attachInbound(r, channel, m)
 }
 func signedInbound(secret, signature string, body []byte) bool {
 	if secret == "" {
@@ -151,7 +175,7 @@ func signedInbound(secret, signature string, body []byte) bool {
 	got, err := hex.DecodeString(strings.TrimPrefix(signature, "sha256="))
 	return err == nil && hmac.Equal(got, want.Sum(nil))
 }
-func handleInboundEmail(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleInboundEmail(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
 	if err != nil {
 		writeError(w, 400, "Message too large")
@@ -168,11 +192,17 @@ func handleInboundEmail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Invalid email payload")
 		return
 	}
-	if err = attachInbound(r, "email", m); err != nil {
+	if err = state.attachInbound(r, "email", m); err != nil {
 		writeError(w, 400, "Could not accept email")
 		return
 	}
 	writeJSON(w, 202, statusResponse{"received"})
+}
+
+func handleInboundEmail(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleInboundEmail(w, r)
 }
 func handleUnmatched(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
@@ -186,7 +216,7 @@ func handleUnmatched(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"messages": rows})
 }
-func handleLinkMessage(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleLinkMessage(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -195,7 +225,7 @@ func handleLinkMessage(w http.ResponseWriter, r *http.Request) {
 	if !decodeRequest(w, r, &req) {
 		return
 	}
-	c, ok := conversationContact(r, req.ContactID)
+	c, ok := state.conversationContact(r, req.ContactID)
 	if !ok {
 		writeError(w, 404, "Contact not found")
 		return
@@ -213,10 +243,16 @@ func handleLinkMessage(w http.ResponseWriter, r *http.Request) {
 	if activityKind != "whatsapp" {
 		activityKind = "email"
 	}
-	mu.Lock()
-	activities = append(activities, Activity{RecordScope: c.RecordScope, ID: newID("a"), ContactID: c.ID, Kind: activityKind, Title: "Incoming " + channel + " · " + subject, Body: body, CreatedBy: currentUser(r).Name, CreatedAt: utcNow(), OccurredAt: utcNow()})
-	mu.Unlock()
+	state.mu.Lock()
+	state.activities = append(state.activities, Activity{RecordScope: c.RecordScope, ID: newID("a"), ContactID: c.ID, Kind: activityKind, Title: "Incoming " + channel + " · " + subject, Body: body, CreatedBy: currentUser(r).Name, CreatedAt: utcNow(), OccurredAt: utcNow()})
+	state.mu.Unlock()
 	writeJSON(w, 200, statusResponse{"linked"})
+}
+
+func handleLinkMessage(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleLinkMessage(w, r)
 }
 func handleWhatsAppChallenge(w http.ResponseWriter, r *http.Request) {
 	token := os.Getenv("WHATSAPP_VERIFY_TOKEN")
@@ -227,7 +263,7 @@ func handleWhatsAppChallenge(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(r.URL.Query().Get("hub.challenge")))
 }
-func handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
 	if err != nil {
 		writeError(w, 400, "Webhook too large")
@@ -272,7 +308,7 @@ func handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 				if m.Type != "text" {
 					continue
 				}
-				if err = attachInbound(r, "whatsapp", inboundMessage{ID: m.ID, OrgID: org, From: m.From, Subject: "WhatsApp reply", Body: m.Text.Body, OccurredAt: whatsAppTime(m.Timestamp)}); err != nil {
+				if err = state.attachInbound(r, "whatsapp", inboundMessage{ID: m.ID, OrgID: org, From: m.From, Subject: "WhatsApp reply", Body: m.Text.Body, OccurredAt: whatsAppTime(m.Timestamp)}); err != nil {
 					writeError(w, 500, "Could not save reply")
 					return
 				}
@@ -289,8 +325,14 @@ func handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, statusResponse{"ok"})
 }
-func handleWhatsAppSend(w http.ResponseWriter, r *http.Request) {
-	c, ok := conversationContact(r, r.PathValue("id"))
+
+func handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleWhatsAppWebhook(w, r)
+}
+func (state *runtimeStore) handleWhatsAppSend(w http.ResponseWriter, r *http.Request) {
+	c, ok := state.conversationContact(r, r.PathValue("id"))
 	if !ok {
 		writeError(w, 404, "Contact not found")
 		return
@@ -325,6 +367,12 @@ func handleWhatsAppSend(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 202, map[string]string{"id": id, "status": "queued"})
 }
+
+func handleWhatsAppSend(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleWhatsAppSend(w, r)
+}
 func processWhatsApp(ctx context.Context) {
 	org := os.Getenv("WHATSAPP_ORG_ID")
 	if org == "" || os.Getenv("WHATSAPP_ACCESS_TOKEN") == "" {
@@ -347,7 +395,14 @@ func processWhatsApp(ctx context.Context) {
 		database.Exec("UPDATE conversations SET status='failed' WHERE id=?", id)
 		return
 	}
-	database.Exec("UPDATE conversations SET status='sending' WHERE id=? AND status='queued'", id)
+	claim, err := database.Exec("UPDATE conversations SET status='sending' WHERE id=? AND status='queued'", id)
+	if err != nil {
+		return
+	}
+	claimed, err := claim.RowsAffected()
+	if err != nil || claimed != 1 {
+		return
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://graph.facebook.com/"+version+"/"+phone+"/messages", bytes.NewReader(b))
 	if err != nil {
 		return

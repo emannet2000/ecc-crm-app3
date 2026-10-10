@@ -50,6 +50,8 @@
       returnFocus = document.activeElement;
       drawer = sidebar;
       requestAnimationFrame(() => { if (drawer === sidebar) (sidebar.querySelector('.sidebar__close') || focusable(sidebar)[0])?.focus(); });
+    } else if (open && !sidebar.contains(document.activeElement)) {
+      (sidebar.querySelector('.sidebar__close') || focusable(sidebar)[0])?.focus();
     } else if (!open && drawer) {
       drawer = null;
       if (navigated) {
@@ -63,7 +65,7 @@
   function refresh() {
     pending = false;
     prepareTables(document);
-    for (const host of document.querySelectorAll('crm-workspace,crm-record-tools,crm-insights,crm-administration')) {
+    for (const host of document.querySelectorAll('crm-workspace,crm-record-tools,crm-insights,crm-administration,crm-student-journey,crm-my-work,crm-recent-changes')) {
       const root = host.shadowRoot;
       if (!root) continue;
       if (!watched.has(root)) {
@@ -79,6 +81,11 @@
   mobile.addEventListener('change', schedule);
   document.addEventListener('click', event => {
     if (drawer && event.target.closest('.sidebar .nav-item')) navigated = true;
+  }, true);
+  document.addEventListener('focusin', event => {
+    if (mobile.matches && drawer?.classList.contains('is-open') && !drawer.contains(event.target)) {
+      (drawer.querySelector('.sidebar__close') || focusable(drawer)[0])?.focus();
+    }
   }, true);
   document.addEventListener('keydown', event => {
     if (!drawer || event.key !== 'Tab') return;

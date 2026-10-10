@@ -70,12 +70,12 @@ func validateAgent(req agentRequest) map[string]string {
 	return fields
 }
 
-func listAgentsHandler(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listAgentsHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listAgents()
-	agentCounts, _ := linkedStudentCounts()
+	all := state.listAgents()
+	agentCounts, _ := state.linkedStudentCounts()
 	filtered := make([]Agent, 0, len(all))
 	for _, a := range all {
 		a.StudentsReferred = agentCounts[a.ID]
@@ -96,19 +96,31 @@ func listAgentsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getAgentHandler(w http.ResponseWriter, r *http.Request) {
+func listAgentsHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listAgentsHandler(w, r)
+}
+
+func (state *runtimeStore) getAgentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	a, ok := getAgentByID(id)
+	a, ok := state.getAgentByID(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Agent not found")
 		return
 	}
-	agentCounts, _ := linkedStudentCounts()
+	agentCounts, _ := state.linkedStudentCounts()
 	a.StudentsReferred = agentCounts[a.ID]
 	writeJSON(w, http.StatusOK, map[string]any{"agent": a})
 }
 
-func createAgentHandler(w http.ResponseWriter, r *http.Request) {
+func getAgentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getAgentHandler(w, r)
+}
+
+func (state *runtimeStore) createAgentHandler(w http.ResponseWriter, r *http.Request) {
 	var req agentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -122,7 +134,7 @@ func createAgentHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
@@ -142,14 +154,20 @@ func createAgentHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        now,
 	}
 
-	mu.Lock()
-	agents = append(agents, newAgent)
-	mu.Unlock()
+	state.mu.Lock()
+	state.agents = append(state.agents, newAgent)
+	state.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"agent": newAgent})
 }
 
-func updateAgentHandler(w http.ResponseWriter, r *http.Request) {
+func createAgentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createAgentHandler(w, r)
+}
+
+func (state *runtimeStore) updateAgentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req agentRequest
@@ -162,11 +180,11 @@ func updateAgentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, a := range agents {
+	for i, a := range state.agents {
 		if a.ID == id {
 			idx = i
 			break
@@ -177,7 +195,7 @@ func updateAgentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := agents[idx]
+	updated := state.agents[idx]
 	updated.Name = strings.TrimSpace(req.Name)
 	updated.AgentCode = strings.TrimSpace(req.AgentCode)
 	updated.CountryCode = strings.TrimSpace(strings.ToUpper(req.CountryCode))
@@ -186,18 +204,24 @@ func updateAgentHandler(w http.ResponseWriter, r *http.Request) {
 	updated.StudentsReferred = req.StudentsReferred
 	updated.Notes = req.Notes
 
-	agents[idx] = updated
+	state.agents[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"agent": updated})
 }
 
-func deleteAgentHandler(w http.ResponseWriter, r *http.Request) {
+func updateAgentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateAgentHandler(w, r)
+}
+
+func (state *runtimeStore) deleteAgentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, a := range agents {
+	for i, a := range state.agents {
 		if a.ID == id {
 			idx = i
 			break
@@ -208,14 +232,20 @@ func deleteAgentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agents = append(agents[:idx], agents[idx+1:]...)
+	state.agents = append(state.agents[:idx], state.agents[idx+1:]...)
 
-	for i := range students {
-		if students[i].AgentID == id {
-			students[i].AgentID = ""
-			students[i].AgentName = ""
+	for i := range state.students {
+		if state.students[i].AgentID == id {
+			state.students[i].AgentID = ""
+			state.students[i].AgentName = ""
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteAgentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteAgentHandler(w, r)
 }

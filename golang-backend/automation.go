@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,16 +25,26 @@ func notification(org, owner, kind, title, body, path, dedupe string) {
 	}
 	database.Exec("INSERT OR IGNORE INTO notifications VALUES(?,?,?,?,?,?,?,?,?,NULL)", newID("notice"), org, owner, kind, title, body, path, dedupe, utcNow())
 }
+func notificationWithDB(db DBRunner, org, owner, kind, title, body, path, dedupe string) {
+	if owner == "" {
+		return
+	}
+	db.Exec("INSERT OR IGNORE INTO notifications VALUES(?,?,?,?,?,?,?,?,?,NULL)", newID("notice"), org, owner, kind, title, body, path, dedupe, utcNow())
+}
 func generateReminders() {
-	mutationMu.Lock()
-	defer mutationMu.Unlock()
-	original := cloneStore()
-	s := cloneStore()
+	runner, r, state, close, err := workerRuntime(context.Background(), "")
+	if err != nil {
+		return
+	}
+	defer close()
+	tx := runner.(*sql.Tx)
+	original := state.cloneStore()
+	s := state.cloneStore()
 	changed := false
 	type recurrence struct{ org, parent string }
 	nextRecurrences := []recurrence{}
 	zones := map[string]*time.Location{}
-	orgs, err := database.Query("SELECT id,timezone FROM organizations")
+	orgs, err := tx.Query("SELECT id,timezone FROM organizations")
 	if err == nil {
 		for orgs.Next() {
 			var id, zone string
@@ -53,14 +64,17 @@ func generateReminders() {
 		}
 		return time.Now().In(zone).AddDate(0, 0, offset).Format("2006-01-02")
 	}
+	if err = remindPendingHandoffs(tx, s, orgDay); err != nil {
+		return
+	}
 	today := time.Now().Format("2006-01-02")
 	for _, t := range s.Tasks {
 		if t.Status != "done" && t.ReminderDate != "" && t.ReminderDate <= orgDay(t.OrgID, 0) {
-			notification(t.OrgID, t.OwnerID, "task", "Task reminder", t.Title, "/tasks", "task:"+t.ID+":"+t.ReminderDate)
+			notificationWithDB(tx, t.OrgID, t.OwnerID, "task", "Task reminder", t.Title, "/tasks", "task:"+t.ID+":"+t.ReminderDate)
 		}
 		if t.Status == "done" && t.Recurrence != "" && t.Recurrence != "none" {
 			var count int
-			database.QueryRow("SELECT count(*) FROM workspace_entries WHERE category='recurrence' AND record_id=?", t.ID).Scan(&count)
+			tx.QueryRow("SELECT count(*) FROM workspace_entries WHERE category='recurrence' AND record_id=?", t.ID).Scan(&count)
 			if count > 0 {
 				continue
 			}
@@ -93,63 +107,50 @@ func generateReminders() {
 			changed = true
 		}
 		if d.ExpiryDate != "" && d.ExpiryDate <= orgDay(d.OrgID, 30) {
-			notification(d.OrgID, d.OwnerID, "document", "Document expiry", d.DocName+" expires "+d.ExpiryDate, "/cases/"+d.CaseID, "expiry:"+d.ID+":"+d.ExpiryDate)
+			notificationWithDB(tx, d.OrgID, d.OwnerID, "document", "Document expiry", d.DocName+" expires "+d.ExpiryDate, "/cases/"+d.CaseID, "expiry:"+d.ID+":"+d.ExpiryDate)
 		}
 	}
 	for _, c := range s.Cases {
 		if c.NextDeadline != "" && c.NextDeadline <= orgDay(c.OrgID, 3) && c.CurrentStage != "Closed" && c.CurrentStage != "Approved" {
-			notification(c.OrgID, c.OwnerID, "case", "Case deadline", c.CaseNumber+": "+c.NextDeadline, "/cases/"+c.ID, "deadline:"+c.ID+":"+c.NextDeadline)
+			notificationWithDB(tx, c.OrgID, c.OwnerID, "case", "Case deadline", c.CaseNumber+": "+c.NextDeadline, "/cases/"+c.ID, "deadline:"+c.ID+":"+c.NextDeadline)
 		}
 	}
 	for _, inv := range s.Invoices {
 		if inv.Dunning && inv.Balance > 0 && inv.DueDate != "" && inv.DueDate < orgDay(inv.OrgID, 0) {
 			key := "dunning:" + inv.ID + ":" + orgDay(inv.OrgID, 0)
 			var count int
-			database.QueryRow("SELECT count(*) FROM notifications WHERE user_id=? AND dedupe_key=?", inv.OwnerID, key).Scan(&count)
+			tx.QueryRow("SELECT count(*) FROM notifications WHERE user_id=? AND dedupe_key=?", inv.OwnerID, key).Scan(&count)
 			if count > 0 {
 				continue
 			}
-			notification(inv.OrgID, inv.OwnerID, "invoice", "Overdue invoice", inv.InvoiceNumber, "/invoices/"+inv.ID, key)
+			notificationWithDB(tx, inv.OrgID, inv.OwnerID, "invoice", "Overdue invoice", inv.InvoiceNumber, "/invoices/"+inv.ID, key)
 			for _, c := range s.Contacts {
 				if c.ID == inv.ClientID && validEmail(c.Email) {
-					database.Exec("INSERT INTO mail_outbox(id,org_id,user_id,contact_id,invoice_id,kind,recipient,subject,body,status,created_at,next_attempt) VALUES(?,?,?,?,?,'reminder',?,?,?,'queued',?,?)", newID("mail"), inv.OrgID, inv.OwnerID, c.ID, inv.ID, c.Email, "Payment reminder: "+inv.InvoiceNumber, fmt.Sprintf("Your invoice balance is %s %.2f, due %s.", currencyOf(inv.Currency), inv.Balance, inv.DueDate), utcNow(), utcNow())
+					tx.Exec("INSERT INTO mail_outbox(id,org_id,user_id,contact_id,invoice_id,kind,recipient,subject,body,status,created_at,next_attempt) VALUES(?,?,?,?,?,'reminder',?,?,?,'queued',?,?)", newID("mail"), inv.OrgID, inv.OwnerID, c.ID, inv.ID, c.Email, "Payment reminder: "+inv.InvoiceNumber, fmt.Sprintf("Your invoice balance is %s %.2f, due %s.", currencyOf(inv.Currency), inv.Balance, inv.DueDate), utcNow(), utcNow())
 				}
 			}
 		}
 	}
 
 	if changed {
-		restoreStore(s)
-		applyComputedData()
-		events := changesBetween(original, snapshot(), "System")
-		tx, err := database.Begin()
-		if err == nil {
-			err = saveDatabaseTx(tx, events)
-			if err == nil {
-				for _, rec := range nextRecurrences {
-					if _, err = tx.Exec("INSERT INTO workspace_entries VALUES(?,?, 'recurrence','',?,'{}',?,?)", newID("entry"), rec.org, rec.parent, utcNow(), utcNow()); err != nil {
-						break
-					}
-				}
-			}
-			if err == nil {
-				r, _ := http.NewRequest("POST", "http://localhost/internal/reminders", nil)
-				r = r.WithContext(context.WithValue(r.Context(), requestTxKey, tx))
-				err = queueChangeEvents(r, events)
-			}
-			if err == nil {
-				err = tx.Commit()
-			} else {
-				tx.Rollback()
+		state.restoreStore(s)
+		state.applyComputedData()
+		events := changesBetween(original, state.snapshot(), "System")
+		if err = saveStoreDeltaTx(tx, original, state.snapshot(), events); err != nil {
+			return
+		}
+		for _, rec := range nextRecurrences {
+			if _, err = tx.Exec("INSERT INTO workspace_entries VALUES(?,?, 'recurrence','',?,'{}',?,?)", newID("entry"), rec.org, rec.parent, utcNow(), utcNow()); err != nil {
+				return
 			}
 		}
-		if err != nil {
-			restoreStore(original)
+		if err = state.queueChangeEvents(r, events); err != nil {
+			return
 		}
 	}
 
 	// Notification emails are opt-in per user; unique entries prevent repeated sends.
-	rows, err := database.Query("SELECT n.id,n.org_id,n.user_id,n.title,n.body FROM notifications n JOIN workspace_entries p ON p.user_id=n.user_id AND p.category='notification_preferences' AND json_extract(p.data,'$.email')=1 WHERE NOT EXISTS(SELECT 1 FROM workspace_entries e WHERE e.category='notification_email' AND e.record_id=n.id) LIMIT 20")
+	rows, err := tx.Query("SELECT n.id,n.org_id,n.user_id,n.title,n.body FROM notifications n JOIN workspace_entries p ON p.user_id=n.user_id AND p.category='notification_preferences' AND json_extract(p.data,'$.email')=1 WHERE NOT EXISTS(SELECT 1 FROM workspace_entries e WHERE e.category='notification_email' AND e.record_id=n.id) LIMIT 20")
 	if err != nil {
 		return
 	}
@@ -162,13 +163,15 @@ func generateReminders() {
 	}
 	rows.Close()
 	for _, v := range pending {
-		u, ok := findUserByID(v.user)
+		u, ok := state.findUserByID(v.user)
 		if !ok {
 			continue
 		}
-		database.Exec("INSERT INTO mail_outbox(id,org_id,user_id,contact_id,invoice_id,kind,recipient,subject,body,status,created_at,next_attempt) VALUES(?,?,?,'','','notification',?,?,?,'queued',?,?)", newID("mail"), v.org, v.user, u.Email, v.title, v.body, utcNow(), utcNow())
-		database.Exec("INSERT INTO workspace_entries VALUES(?,?, 'notification_email',?,?, '{}',?,?)", newID("entry"), v.org, v.user, v.id, utcNow(), utcNow())
+		tx.Exec("INSERT INTO mail_outbox(id,org_id,user_id,contact_id,invoice_id,kind,recipient,subject,body,status,created_at,next_attempt) VALUES(?,?,?,'','','notification',?,?,?,'queued',?,?)", newID("mail"), v.org, v.user, u.Email, v.title, v.body, utcNow(), utcNow())
+		tx.Exec("INSERT INTO workspace_entries VALUES(?,?, 'notification_email',?,?, '{}',?,?)", newID("entry"), v.org, v.user, v.id, utcNow(), utcNow())
 	}
+
+	tx.Commit()
 }
 func publicURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -220,6 +223,7 @@ func handleWebhookSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]string{"id": id, "secret": secret})
 }
 func deliverWebhooks() {
+	database.Exec("UPDATE webhook_deliveries SET status='queued' WHERE status='sending' AND next_attempt<=?", utcNow())
 	rows, err := database.Query("SELECT d.id,d.payload,d.attempts,w.data FROM webhook_deliveries d JOIN workspace_entries w ON w.id=d.webhook_id WHERE d.status='queued' AND d.next_attempt<=? LIMIT 10", utcNow())
 	if err != nil {
 		return
@@ -236,6 +240,9 @@ func deliverWebhooks() {
 	}
 	rows.Close()
 	for _, v := range jobs {
+		if !claimDelivery("webhook_deliveries", v.id) {
+			continue
+		}
 		var config struct {
 			URL, Secret string
 			Enabled     bool
@@ -321,8 +328,18 @@ func deliverPushNotifications() {
 		if json.Unmarshal([]byte(j.data), &sub) != nil || !allowedPush(sub.Endpoint) {
 			continue
 		}
+		claimID := "push_claim_" + hashSecret(j.org+":"+j.id+":"+j.subID)
+		result, claimErr := database.Exec("INSERT OR IGNORE INTO workspace_entries VALUES(?,?, 'push_claim',?,?, '{}',?,?)", claimID, j.org, j.user, j.id+":"+j.subID, utcNow(), utcNow())
+		if claimErr != nil {
+			continue
+		}
+		claimed, _ := result.RowsAffected()
+		if claimed != 1 {
+			continue
+		}
 		res, err := webpush.SendNotification([]byte(mustJSON(map[string]string{"title": j.title, "body": j.body, "path": j.path})), &sub, &webpush.Options{Subscriber: os.Getenv("VAPID_SUBJECT"), VAPIDPublicKey: pub, VAPIDPrivateKey: private, TTL: 3600, HTTPClient: webhookClient()})
 		if err != nil {
+			database.Exec("UPDATE workspace_entries SET data=? WHERE id=?", mustJSON(map[string]string{"status": "delivery_unknown"}), claimID)
 			continue
 		}
 		res.Body.Close()

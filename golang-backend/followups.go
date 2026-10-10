@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
@@ -242,7 +243,7 @@ func decodeFollowupRule(w http.ResponseWriter, r *http.Request) (followupRule, b
 	return rule, true
 }
 
-func previewFollowupRule(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) previewFollowupRule(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -251,7 +252,7 @@ func previewFollowupRule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	matches, err := followupMatches(rule, currentUser(r).OrgID, snapshot(), storeDB(r))
+	matches, err := followupMatches(rule, currentUser(r).OrgID, state.snapshot(), storeDB(r))
 	if err != nil {
 		writeError(w, 500, "Could not preview activity for this rule")
 		return
@@ -264,7 +265,13 @@ func previewFollowupRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"count": len(matches), "records": preview, "previewToken": followupPreviewToken(rule, currentUser(r).OrgID, matches), "previewExpiresAt": rule.PreviewExpiresAt})
 }
 
-func saveFollowupRule(w http.ResponseWriter, r *http.Request) {
+func previewFollowupRule(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.previewFollowupRule(w, r)
+}
+
+func (state *runtimeStore) saveFollowupRule(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -277,7 +284,7 @@ func saveFollowupRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "Preview this rule before saving it")
 		return
 	}
-	matches, err := followupMatches(rule, currentUser(r).OrgID, snapshot(), storeDB(r))
+	matches, err := followupMatches(rule, currentUser(r).OrgID, state.snapshot(), storeDB(r))
 	if err != nil {
 		writeError(w, 500, "Could not verify the rule preview")
 		return
@@ -296,7 +303,13 @@ func saveFollowupRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]string{"id": id})
 }
 
-func listFollowupRules(w http.ResponseWriter, r *http.Request) {
+func saveFollowupRule(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.saveFollowupRule(w, r)
+}
+
+func (state *runtimeStore) listFollowupRules(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -309,7 +322,7 @@ func listFollowupRules(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		var rule followupRule
 		json.Unmarshal([]byte(fmtString(row["data"])), &rule)
-		matches, err := followupMatches(rule, currentUser(r).OrgID, snapshot(), storeDB(r))
+		matches, err := followupMatches(rule, currentUser(r).OrgID, state.snapshot(), storeDB(r))
 		if err != nil {
 			writeError(w, 500, "Could not calculate follow-up rule matches")
 			return
@@ -319,7 +332,13 @@ func listFollowupRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"rules": rows})
 }
 
-func refreshFollowupPreview(w http.ResponseWriter, r *http.Request) {
+func listFollowupRules(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listFollowupRules(w, r)
+}
+
+func (state *runtimeStore) refreshFollowupPreview(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -335,7 +354,7 @@ func refreshFollowupPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rule.Enabled = false
-	matches, err := followupMatches(rule, currentUser(r).OrgID, snapshot(), storeDB(r))
+	matches, err := followupMatches(rule, currentUser(r).OrgID, state.snapshot(), storeDB(r))
 	if err != nil {
 		writeError(w, 500, "Could not preview activity for this rule")
 		return
@@ -353,7 +372,13 @@ func refreshFollowupPreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"count": len(matches), "records": preview, "previewToken": rule.PreviewToken, "previewExpiresAt": rule.PreviewExpiresAt})
 }
 
-func toggleFollowupRule(w http.ResponseWriter, r *http.Request) {
+func refreshFollowupPreview(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.refreshFollowupPreview(w, r)
+}
+
+func (state *runtimeStore) toggleFollowupRule(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -376,7 +401,7 @@ func toggleFollowupRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Enabled {
-		matches, err := followupMatches(rule, currentUser(r).OrgID, snapshot(), storeDB(r))
+		matches, err := followupMatches(rule, currentUser(r).OrgID, state.snapshot(), storeDB(r))
 		if err != nil {
 			writeError(w, 500, "Could not verify the rule preview")
 			return
@@ -393,6 +418,12 @@ func toggleFollowupRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"status": "ok", "enabled": rule.Enabled})
+}
+
+func toggleFollowupRule(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.toggleFollowupRule(w, r)
 }
 
 func editFollowupRule(w http.ResponseWriter, r *http.Request) {
@@ -472,9 +503,9 @@ func listFollowupHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": rows})
 }
 
-func caseStageHistory(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) caseStageHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s := snapshot()
+	s := state.snapshot()
 	var c *Case
 	for i := range s.Cases {
 		if s.Cases[i].ID == id && canRead(s.Cases[i].RecordScope, currentUser(r)) {
@@ -494,9 +525,15 @@ func caseStageHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"caseId": id, "owner": c.AssignedOfficer, "currentStage": c.CurrentStage, "history": rows})
 }
 
-func studentApplicationHistory(w http.ResponseWriter, r *http.Request) {
+func caseStageHistory(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.caseStageHistory(w, r)
+}
+
+func (state *runtimeStore) studentApplicationHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s := snapshot()
+	s := state.snapshot()
 	visible := false
 	for _, st := range s.Students {
 		if st.ID == id && st.OrgID == currentUser(r).OrgID && canRead(st.RecordScope, currentUser(r)) {
@@ -523,9 +560,15 @@ func studentApplicationHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"studentId": id, "applications": items})
 }
 
-func applicationActionQueue(w http.ResponseWriter, r *http.Request) {
-	s := snapshot()
-	today := time.Now().Format("2006-01-02")
+func studentApplicationHistory(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.studentApplicationHistory(w, r)
+}
+
+func (state *runtimeStore) applicationActionQueue(w http.ResponseWriter, r *http.Request) {
+	s := state.snapshot()
+	today := organizationToday(r)
 	items := []map[string]any{}
 	studentNames := map[string]string{}
 	for _, student := range s.Students {
@@ -560,12 +603,24 @@ func applicationActionQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
 }
 
+func applicationActionQueue(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.applicationActionQueue(w, r)
+}
+
 // runFollowupRules creates at most one open task per rule and source record.
 // Each execution marker and its task are committed with the same database write.
 func runFollowupRules() {
-	mutationMu.Lock()
-	defer mutationMu.Unlock()
-	rows, err := database.Query("SELECT id,org_id,data FROM workspace_entries WHERE category='followup_rule'")
+	runner, r, state, close, err := workerRuntime(context.Background(), "")
+	if err != nil {
+		followupAutomationFailures.Add(1)
+		return
+	}
+	defer close()
+	tx := runner.(*sql.Tx)
+	_ = r
+	rows, err := tx.Query("SELECT id,org_id,data FROM workspace_entries WHERE category='followup_rule'")
 	if err != nil {
 		followupAutomationFailures.Add(1)
 		return
@@ -586,10 +641,10 @@ func runFollowupRules() {
 	if len(rules) == 0 {
 		return
 	}
-	original, next := cloneStore(), cloneStore()
+	original, next := state.cloneStore(), state.cloneStore()
 	created := []struct{ rule, record, org, task string }{}
 	for _, item := range rules {
-		matches, err := followupMatches(item.rule, item.org, next, database)
+		matches, err := followupMatches(item.rule, item.org, next, tx)
 		if err != nil {
 			followupAutomationFailures.Add(1)
 			continue
@@ -597,7 +652,7 @@ func runFollowupRules() {
 		for _, match := range matches {
 			key := item.id + ":" + match.ID
 			var exists int
-			if database.QueryRow("SELECT count(*) FROM workspace_entries WHERE org_id=? AND category='followup_execution' AND record_id=?", item.org, key).Scan(&exists) != nil || exists > 0 {
+			if tx.QueryRow("SELECT count(*) FROM workspace_entries WHERE org_id=? AND category='followup_execution' AND record_id=?", item.org, key).Scan(&exists) != nil || exists > 0 {
 				continue
 			}
 			ownerName := match.Owner
@@ -614,19 +669,16 @@ func runFollowupRules() {
 			title := strings.ReplaceAll(item.rule.TaskTitle, "{{record}}", match.Name)
 			description := strings.TrimSpace(item.rule.Description + "\n\nCreated by follow-up rule: " + item.rule.Name + " · " + match.Entity + " " + match.ID + " · Last updated " + match.LastTouch)
 			taskID := newID("t")
-			next.Tasks = append(next.Tasks, Task{RecordScope: match.Scope, ID: taskID, Title: title, Description: description, Status: "todo", DueDate: organizationTodayForOrg(item.org), ReminderDate: organizationTodayForOrg(item.org), ContactID: match.ContactID, ContactName: contactName, Owner: ownerName, CreatedAt: organizationTodayForOrg(item.org)})
+			next.Tasks = append(next.Tasks, Task{RecordScope: match.Scope, ID: taskID, Title: title, Description: description, Status: "todo", DueDate: todayForOrgDB(tx, item.org), ReminderDate: todayForOrgDB(tx, item.org), ContactID: match.ContactID, ContactName: contactName, Owner: ownerName, CreatedAt: todayForOrgDB(tx, item.org)})
 			created = append(created, struct{ rule, record, org, task string }{item.id, match.ID, item.org, taskID})
 		}
 	}
 	if len(created) == 0 {
 		return
 	}
-	restoreStore(next)
-	events := changesBetween(original, snapshot(), "Follow-up automation")
-	tx, err := database.Begin()
-	if err == nil {
-		err = saveDatabaseTx(tx, events)
-	}
+	state.restoreStore(next)
+	events := changesBetween(original, state.snapshot(), "Follow-up automation")
+	err = saveStoreDeltaTx(tx, original, state.snapshot(), events)
 	if err == nil {
 		for _, item := range created {
 			if _, err = tx.Exec("INSERT INTO workspace_entries VALUES(?,?, 'followup_execution','',?,?,?,?)", newID("entry"), item.org, item.rule+":"+item.record, mustJSON(map[string]string{"taskId": item.task}), utcNow(), utcNow()); err != nil {
@@ -641,7 +693,7 @@ func runFollowupRules() {
 	}
 	if err != nil {
 		followupAutomationFailures.Add(1)
-		restoreStore(original)
+		state.restoreStore(original)
 	}
 }
 
@@ -665,8 +717,8 @@ type qualityFinding struct {
 	Detail   string `json:"detail"`
 }
 
-func handleDataQuality(w http.ResponseWriter, r *http.Request) {
-	s := snapshot()
+func (state *runtimeStore) handleDataQuality(w http.ResponseWriter, r *http.Request) {
+	s := state.snapshot()
 	org := currentUser(r).OrgID
 	f := []qualityFinding{}
 	add := func(entity, id, severity, title, detail string, scope RecordScope) {
@@ -797,7 +849,7 @@ func handleDataQuality(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, c := range s.Cases {
-		if c.OrgID == org && c.CurrentStage != "Approved" && c.CurrentStage != "Closed" && c.NextDeadline != "" && c.NextDeadline < time.Now().Format("2006-01-02") {
+		if c.OrgID == org && c.CurrentStage != "Approved" && c.CurrentStage != "Closed" && c.NextDeadline != "" && c.NextDeadline < organizationToday(r) {
 			add("cases", c.ID, "error", "Deadline is overdue", c.CaseNumber+" passed its deadline on "+c.NextDeadline+".", c.RecordScope)
 		}
 	}
@@ -843,4 +895,10 @@ func handleDataQuality(w http.ResponseWriter, r *http.Request) {
 		end = total
 	}
 	writeJSON(w, 200, map[string]any{"findings": filtered[start:end], "total": total, "totalAll": totalAll, "page": page, "pageSize": pageSize, "pages": (total + pageSize - 1) / pageSize})
+}
+
+func handleDataQuality(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleDataQuality(w, r)
 }

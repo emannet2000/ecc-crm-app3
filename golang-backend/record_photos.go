@@ -75,12 +75,12 @@ func handleQRDecode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"value": value})
 }
 
-func recordPhotoScope(r *http.Request, write bool) (RecordScope, bool) {
+func (state *runtimeStore) recordPhotoScope(r *http.Request, write bool) (RecordScope, bool) {
 	entity, id := r.PathValue("entity"), r.PathValue("id")
 	if (entity != "contacts" && entity != "students") || id == "" {
 		return RecordScope{}, false
 	}
-	payload, ok := recordsOf(snapshot())[entity][id]
+	payload, ok := recordsOf(state.snapshot())[entity][id]
 	if !ok {
 		return RecordScope{}, false
 	}
@@ -97,6 +97,12 @@ func recordPhotoScope(r *http.Request, write bool) (RecordScope, bool) {
 	return record.RecordScope, true
 }
 
+func recordPhotoScope(r *http.Request, write bool) (RecordScope, bool) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	return state.recordPhotoScope(r, write)
+}
+
 func auditRecordPhoto(r *http.Request, scope RecordScope, action string) error {
 	label := "Profile photo updated"
 	if action == "photo_removed" {
@@ -106,13 +112,13 @@ func auditRecordPhoto(r *http.Request, scope RecordScope, action string) error {
 	return err
 }
 
-func handleRecordQR(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleRecordQR(w http.ResponseWriter, r *http.Request) {
 	entity, id := r.PathValue("entity"), r.PathValue("id")
 	if !validEntity(entity) || id == "" {
 		writeError(w, http.StatusNotFound, "Record not found")
 		return
 	}
-	payload, ok := recordsOf(snapshot())[entity][id]
+	payload, ok := recordsOf(state.snapshot())[entity][id]
 	if !ok {
 		writeError(w, http.StatusNotFound, "Record not found")
 		return
@@ -144,8 +150,14 @@ func handleRecordQR(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(png)
 }
 
-func handleRecordPhoto(w http.ResponseWriter, r *http.Request) {
-	scope, ok := recordPhotoScope(r, false)
+func handleRecordQR(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRecordQR(w, r)
+}
+
+func (state *runtimeStore) handleRecordPhoto(w http.ResponseWriter, r *http.Request) {
+	scope, ok := state.recordPhotoScope(r, false)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Record photo not found")
 		return
@@ -165,8 +177,14 @@ func handleRecordPhoto(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func handleRecordPhotoUpload(w http.ResponseWriter, r *http.Request) {
-	scope, ok := recordPhotoScope(r, true)
+func handleRecordPhoto(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRecordPhoto(w, r)
+}
+
+func (state *runtimeStore) handleRecordPhotoUpload(w http.ResponseWriter, r *http.Request) {
+	scope, ok := state.recordPhotoScope(r, true)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Record not found or you cannot edit it")
 		return
@@ -213,8 +231,14 @@ func handleRecordPhotoUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"message": "Photo updated", "updatedAt": utcNow()})
 }
 
-func handleRecordPhotoDelete(w http.ResponseWriter, r *http.Request) {
-	scope, ok := recordPhotoScope(r, true)
+func handleRecordPhotoUpload(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRecordPhotoUpload(w, r)
+}
+
+func (state *runtimeStore) handleRecordPhotoDelete(w http.ResponseWriter, r *http.Request) {
+	scope, ok := state.recordPhotoScope(r, true)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Record not found or you cannot edit it")
 		return
@@ -231,4 +255,10 @@ func handleRecordPhotoDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleRecordPhotoDelete(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRecordPhotoDelete(w, r)
 }

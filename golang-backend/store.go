@@ -1,13 +1,13 @@
 package main
 
 import (
-	"fmt"
+	"crypto/rand"
+	"encoding/hex"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -261,8 +261,10 @@ type Invoice struct {
 }
 
 type Payment struct {
-	Currency string `json:"currency"`
-	Status   string `json:"status"`
+	ReviewedBy string `json:"reviewedBy,omitempty"`
+	ReviewedAt string `json:"reviewedAt,omitempty"`
+	Currency   string `json:"currency"`
+	Status     string `json:"status"`
 	RecordScope
 	ID        string  `json:"id"`
 	InvoiceID string  `json:"invoiceId"`
@@ -321,7 +323,11 @@ var (
 )
 
 func newID(prefix string) string {
-	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		panic(err)
+	}
+	return prefix + "_" + hex.EncodeToString(entropy[:])
 }
 
 func parseLimitOffset(r *http.Request, defaultLimit, defaultOffset int) (limit, offset int) {
@@ -911,27 +917,39 @@ func seedPartners() {
 	log.Println("Seeded 3 partners")
 }
 
-func findUserByEmail(email string) (User, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	u, ok := users[strings.ToLower(strings.TrimSpace(email))]
+func (state *runtimeStore) findUserByEmail(email string) (User, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	u, ok := state.users[strings.ToLower(strings.TrimSpace(email))]
 	return u, ok
+}
+
+func findUserByEmail(email string) (User, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.findUserByEmail(email)
 }
 
 // ================= SCHOOLS: ACCESSORS =================
 
-func listSchools() []School {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]School, len(schools))
-	copy(out, schools)
+func (state *runtimeStore) listSchools() []School {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]School, len(state.schools))
+	copy(out, state.schools)
 	return out
 }
 
-func getSchoolByID(id string) (School, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, s := range schools {
+func listSchools() []School {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listSchools()
+}
+
+func (state *runtimeStore) getSchoolByID(id string) (School, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, s := range state.schools {
 		if s.ID == id {
 			return s, true
 		}
@@ -939,20 +957,32 @@ func getSchoolByID(id string) (School, bool) {
 	return School{}, false
 }
 
+func getSchoolByID(id string) (School, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getSchoolByID(id)
+}
+
 // ================= STUDENTS: ACCESSORS =================
 
-func listStudents() []Student {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Student, len(students))
-	copy(out, students)
+func (state *runtimeStore) listStudents() []Student {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Student, len(state.students))
+	copy(out, state.students)
 	return out
 }
 
-func getStudentByID(id string) (Student, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, s := range students {
+func listStudents() []Student {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listStudents()
+}
+
+func (state *runtimeStore) getStudentByID(id string) (Student, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, s := range state.students {
 		if s.ID == id {
 			return s, true
 		}
@@ -960,20 +990,32 @@ func getStudentByID(id string) (Student, bool) {
 	return Student{}, false
 }
 
+func getStudentByID(id string) (Student, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getStudentByID(id)
+}
+
 // ================= AGENTS: ACCESSORS =================
 
-func listAgents() []Agent {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Agent, len(agents))
-	copy(out, agents)
+func (state *runtimeStore) listAgents() []Agent {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Agent, len(state.agents))
+	copy(out, state.agents)
 	return out
 }
 
-func getAgentByID(id string) (Agent, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, a := range agents {
+func listAgents() []Agent {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listAgents()
+}
+
+func (state *runtimeStore) getAgentByID(id string) (Agent, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, a := range state.agents {
 		if a.ID == id {
 			return a, true
 		}
@@ -981,20 +1023,32 @@ func getAgentByID(id string) (Agent, bool) {
 	return Agent{}, false
 }
 
+func getAgentByID(id string) (Agent, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getAgentByID(id)
+}
+
 // ================= LEADS: ACCESSORS =================
 
-func listLeads() []Lead {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Lead, len(leads))
-	copy(out, leads)
+func (state *runtimeStore) listLeads() []Lead {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Lead, len(state.leads))
+	copy(out, state.leads)
 	return out
 }
 
-func getLeadByID(id string) (Lead, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, l := range leads {
+func listLeads() []Lead {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listLeads()
+}
+
+func (state *runtimeStore) getLeadByID(id string) (Lead, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, l := range state.leads {
 		if l.ID == id {
 			return l, true
 		}
@@ -1002,20 +1056,32 @@ func getLeadByID(id string) (Lead, bool) {
 	return Lead{}, false
 }
 
+func getLeadByID(id string) (Lead, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getLeadByID(id)
+}
+
 // ================= CASES: ACCESSORS =================
 
-func listCases() []Case {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Case, len(cases))
-	copy(out, cases)
+func (state *runtimeStore) listCases() []Case {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Case, len(state.cases))
+	copy(out, state.cases)
 	return out
 }
 
-func getCaseByID(id string) (Case, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, c := range cases {
+func listCases() []Case {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listCases()
+}
+
+func (state *runtimeStore) getCaseByID(id string) (Case, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, c := range state.cases {
 		if c.ID == id {
 			return c, true
 		}
@@ -1023,20 +1089,32 @@ func getCaseByID(id string) (Case, bool) {
 	return Case{}, false
 }
 
+func getCaseByID(id string) (Case, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getCaseByID(id)
+}
+
 // ================= DOCUMENTS: ACCESSORS =================
 
-func listDocuments() []Document {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Document, len(documents))
-	copy(out, documents)
+func (state *runtimeStore) listDocuments() []Document {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Document, len(state.documents))
+	copy(out, state.documents)
 	return out
 }
 
-func getDocumentByID(id string) (Document, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, d := range documents {
+func listDocuments() []Document {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listDocuments()
+}
+
+func (state *runtimeStore) getDocumentByID(id string) (Document, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, d := range state.documents {
 		if d.ID == id {
 			return d, true
 		}
@@ -1044,20 +1122,32 @@ func getDocumentByID(id string) (Document, bool) {
 	return Document{}, false
 }
 
+func getDocumentByID(id string) (Document, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getDocumentByID(id)
+}
+
 // ================= INVOICES: ACCESSORS =================
 
-func listInvoices() []Invoice {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Invoice, len(invoices))
-	copy(out, invoices)
+func (state *runtimeStore) listInvoices() []Invoice {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Invoice, len(state.invoices))
+	copy(out, state.invoices)
 	return out
 }
 
-func getInvoiceByID(id string) (Invoice, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, inv := range invoices {
+func listInvoices() []Invoice {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listInvoices()
+}
+
+func (state *runtimeStore) getInvoiceByID(id string) (Invoice, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, inv := range state.invoices {
 		if inv.ID == id {
 			return inv, true
 		}
@@ -1065,33 +1155,57 @@ func getInvoiceByID(id string) (Invoice, bool) {
 	return Invoice{}, false
 }
 
+func getInvoiceByID(id string) (Invoice, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getInvoiceByID(id)
+}
+
 // ================= PAYMENTS: ACCESSORS =================
 
-func listPayments() []Payment {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Payment, len(payments))
-	copy(out, payments)
+func (state *runtimeStore) listPayments() []Payment {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Payment, len(state.payments))
+	copy(out, state.payments)
 	return out
+}
+
+func listPayments() []Payment {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listPayments()
 }
 
 // ================= PARTNERS: ACCESSORS =================
 
-func listPartners() []Partner {
-	mu.RLock()
-	defer mu.RUnlock()
-	out := make([]Partner, len(partners))
-	copy(out, partners)
+func (state *runtimeStore) listPartners() []Partner {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	out := make([]Partner, len(state.partners))
+	copy(out, state.partners)
 	return out
 }
 
-func getPartnerByID(id string) (Partner, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, p := range partners {
+func listPartners() []Partner {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.listPartners()
+}
+
+func (state *runtimeStore) getPartnerByID(id string) (Partner, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, p := range state.partners {
 		if p.ID == id {
 			return p, true
 		}
 	}
 	return Partner{}, false
+}
+
+func getPartnerByID(id string) (Partner, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.getPartnerByID(id)
 }

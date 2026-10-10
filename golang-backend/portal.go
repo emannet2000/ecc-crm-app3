@@ -24,7 +24,7 @@ func registerPortalRoutes(m *http.ServeMux) {
 		serveFileIfExists(w, r, findProjectRoot()+"/public/portal.html", "text/html; charset=utf-8")
 	})
 }
-func handlePortalInvite(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handlePortalInvite(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
 		writeError(w, 403, "Manager access is required")
 		return
@@ -38,7 +38,7 @@ func handlePortalInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Enter the client's email")
 		return
 	}
-	s := snapshot()
+	s := state.snapshot()
 	allowed := false
 	if req.StudentID != "" {
 		for _, student := range s.Students {
@@ -82,6 +82,12 @@ func handlePortalInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	link := strings.TrimRight(appURL(), "/") + "/portal#invite=" + token
 	writeJSON(w, 201, map[string]string{"id": id, "url": link, "message": "Share this private, single-use link with the client. It expires in 72 hours."})
+}
+
+func handlePortalInvite(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalInvite(w, r)
 }
 func handlePortalInvites(w http.ResponseWriter, r *http.Request) {
 	if !isManager(currentUser(r)) {
@@ -162,19 +168,25 @@ func portalIdentity(r *http.Request) portalGrant {
 	g, _ := r.Context().Value(portalKey).(portalGrant)
 	return g
 }
-func portalCases(g portalGrant) map[string]Case {
+func (state *runtimeStore) portalCases(g portalGrant) map[string]Case {
 	out := map[string]Case{}
-	for _, c := range snapshot().Cases {
+	for _, c := range state.snapshot().Cases {
 		if c.OrgID == g.OrgID && c.ClientID == g.ContactID && ((g.StudentID != "" && c.StudentID == g.StudentID) || (g.StudentID == "")) {
 			out[c.ID] = c
 		}
 	}
 	return out
 }
-func portalDocument(r *http.Request) (Document, bool) {
+
+func portalCases(g portalGrant) map[string]Case {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.portalCases(g)
+}
+func (state *runtimeStore) portalDocument(r *http.Request) (Document, bool) {
 	g := portalIdentity(r)
-	allowed := portalCases(g)
-	for _, d := range snapshot().Documents {
+	allowed := state.portalCases(g)
+	for _, d := range state.snapshot().Documents {
 		if d.ID == r.PathValue("id") && d.OrgID == g.OrgID {
 			_, ok := allowed[d.CaseID]
 			return d, ok
@@ -182,10 +194,16 @@ func portalDocument(r *http.Request) (Document, bool) {
 	}
 	return Document{}, false
 }
-func portalInvoice(r *http.Request) (Invoice, bool) {
+
+func portalDocument(r *http.Request) (Document, bool) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	return state.portalDocument(r)
+}
+func (state *runtimeStore) portalInvoice(r *http.Request) (Invoice, bool) {
 	g := portalIdentity(r)
-	allowed := portalCases(g)
-	for _, i := range snapshot().Invoices {
+	allowed := state.portalCases(g)
+	for _, i := range state.snapshot().Invoices {
 		if i.ID == r.PathValue("id") && i.OrgID == g.OrgID && i.ClientID == g.ContactID {
 			_, ok := allowed[i.CaseID]
 			return i, ok || (i.CaseID == "" && g.StudentID == "")
@@ -193,10 +211,16 @@ func portalInvoice(r *http.Request) (Invoice, bool) {
 	}
 	return Invoice{}, false
 }
-func handlePortalMe(w http.ResponseWriter, r *http.Request) {
+
+func portalInvoice(r *http.Request) (Invoice, bool) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	return state.portalInvoice(r)
+}
+func (state *runtimeStore) handlePortalMe(w http.ResponseWriter, r *http.Request) {
 	g := portalIdentity(r)
-	s := snapshot()
-	allowed := portalCases(g)
+	s := state.snapshot()
+	allowed := state.portalCases(g)
 	cs, ds, is := []map[string]any{}, []map[string]any{}, []map[string]any{}
 	for _, c := range allowed {
 		cs = append(cs, map[string]any{"id": c.ID, "caseNumber": c.CaseNumber, "stage": c.CurrentStage, "nextAction": c.NextAction, "deadline": c.NextDeadline, "destination": c.DestinationCountry})
@@ -231,14 +255,20 @@ func handlePortalMe(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"email": g.Email, "student": student, "cases": cs, "documents": ds, "invoices": is, "messages": messages})
 }
+
+func handlePortalMe(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalMe(w, r)
+}
 func fmtString(v any) string { s, _ := v.(string); return s }
-func handlePortalMessage(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handlePortalMessage(w http.ResponseWriter, r *http.Request) {
 	var req struct{ CaseID, Body string }
 	if !decodeRequest(w, r, &req) {
 		return
 	}
 	g := portalIdentity(r)
-	c, ok := portalCases(g)[req.CaseID]
+	c, ok := state.portalCases(g)[req.CaseID]
 	if !ok {
 		writeError(w, 404, "Case not found")
 		return
@@ -256,23 +286,29 @@ func handlePortalMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "Could not notify your adviser")
 		return
 	}
-	mu.Lock()
-	activities = append(activities, Activity{RecordScope: c.RecordScope, ID: newID("a"), ContactID: g.ContactID, Kind: "note", Title: "Portal response · " + c.CaseNumber, Body: req.Body, OccurredAt: utcNow(), CreatedAt: utcNow(), CreatedBy: g.Email})
-	mu.Unlock()
+	state.mu.Lock()
+	state.activities = append(state.activities, Activity{RecordScope: c.RecordScope, ID: newID("a"), ContactID: g.ContactID, Kind: "note", Title: "Portal response · " + c.CaseNumber, Body: req.Body, OccurredAt: utcNow(), CreatedAt: utcNow(), CreatedBy: g.Email})
+	state.mu.Unlock()
 	writeJSON(w, 201, statusResponse{"received"})
+}
+
+func handlePortalMessage(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalMessage(w, r)
 }
 func portalStaffRequest(r *http.Request, scope RecordScope) *http.Request {
 	u := User{ID: scope.OwnerID, OrgID: scope.OrgID, TeamID: scope.TeamID, Role: "member", Name: portalIdentity(r).Email}
 	return r.WithContext(context.WithValue(r.Context(), requestUserKey, u))
 }
-func handlePortalUpload(w http.ResponseWriter, r *http.Request) {
-	d, ok := portalDocument(r)
+func (state *runtimeStore) handlePortalUpload(w http.ResponseWriter, r *http.Request) {
+	d, ok := state.portalDocument(r)
 	if !ok {
 		writeError(w, 404, "Document not found")
 		return
 	}
 	response := &bufferedResponse{header: make(http.Header)}
-	handleFileUpload(response, portalStaffRequest(r, d.RecordScope))
+	state.handleFileUpload(response, portalStaffRequest(r, d.RecordScope))
 	if response.status >= 200 && response.status < 300 {
 		if err := portalNotify(r, d.RecordScope, "Client document uploaded", d.DocName, "/cases/"+d.CaseID); err != nil {
 			writeError(w, 500, "Could not notify your adviser")
@@ -287,16 +323,28 @@ func handlePortalUpload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(response.status)
 	w.Write(response.body.Bytes())
 }
-func handlePortalDownload(w http.ResponseWriter, r *http.Request) {
-	d, ok := portalDocument(r)
+
+func handlePortalUpload(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalUpload(w, r)
+}
+func (state *runtimeStore) handlePortalDownload(w http.ResponseWriter, r *http.Request) {
+	d, ok := state.portalDocument(r)
 	if !ok {
 		writeError(w, 404, "Document not found")
 		return
 	}
-	handleFileDownload(w, portalStaffRequest(r, d.RecordScope))
+	state.handleFileDownload(w, portalStaffRequest(r, d.RecordScope))
 }
-func handlePortalInvoice(w http.ResponseWriter, r *http.Request) {
-	i, ok := portalInvoice(r)
+
+func handlePortalDownload(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalDownload(w, r)
+}
+func (state *runtimeStore) handlePortalInvoice(w http.ResponseWriter, r *http.Request) {
+	i, ok := state.portalInvoice(r)
 	if !ok {
 		writeError(w, 404, "Invoice not found")
 		return
@@ -310,6 +358,12 @@ func handlePortalInvoice(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", `attachment; filename="invoice.pdf"`)
 	w.Write(data)
+}
+
+func handlePortalInvoice(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handlePortalInvoice(w, r)
 }
 func handlePortalLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie("ecc_portal"); err == nil {

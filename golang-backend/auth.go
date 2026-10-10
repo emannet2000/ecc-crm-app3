@@ -124,15 +124,18 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		id, _ := claims["sub"].(string)
 		jti, _ := claims["jti"].(string)
 
-		user, exists := findUserByEmail(email)
-		if independentRead(r) { user,exists=committedUser(r,"email",email) }
+		user, exists := committedUser(r, "email", email)
 		version, _ := claims["ver"].(float64)
 		if !exists || user.ID != id || user.Disabled || int(version) != user.SessionVersion {
 			writeError(w, http.StatusUnauthorized, "Session has expired")
 			return
 		}
 
-		if jti != "" && isTokenRevoked(jti) {
+		var revoked int
+		if jti != "" {
+			storeDB(r).QueryRow("SELECT count(*) FROM revoked_tokens WHERE id=? AND expires_at>?", jti, utcNow()).Scan(&revoked)
+		}
+		if revoked > 0 {
 			writeError(w, http.StatusUnauthorized, "Token has been revoked")
 			return
 		}
@@ -141,10 +144,10 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func isTokenRevoked(jti string) bool {
-	revokedMu.RLock()
-	defer revokedMu.RUnlock()
-	exp, ok := revokedTokens[jti]
+func (state *runtimeStore) isTokenRevoked(jti string) bool {
+	state.revokedMu.RLock()
+	defer state.revokedMu.RUnlock()
+	exp, ok := state.revokedTokens[jti]
 	if !ok {
 		return false
 	}
@@ -154,23 +157,35 @@ func isTokenRevoked(jti string) bool {
 	return true
 }
 
-func revokeToken(jti string, exp time.Time) {
+func isTokenRevoked(jti string) bool {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.isTokenRevoked(jti)
+}
+
+func (state *runtimeStore) revokeToken(jti string, exp time.Time) {
 	if jti == "" {
 		return
 	}
-	revokedMu.Lock()
-	defer revokedMu.Unlock()
-	revokedTokens[jti] = exp
+	state.revokedMu.Lock()
+	defer state.revokedMu.Unlock()
+	state.revokedTokens[jti] = exp
 }
 
-func handleLogin(w http.ResponseWriter, r *http.Request) {
+func revokeToken(jti string, exp time.Time) {
+	state, release := runtimeForCall(nil)
+	defer release()
+	state.revokeToken(jti, exp)
+}
+
+func (state *runtimeStore) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	user, ok := findUserByEmail(req.Email)
+	user, ok := state.findUserByEmail(req.Email)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "Invalid email or password")
 		return
@@ -188,7 +203,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
 }
 
-func handleRegister(w http.ResponseWriter, r *http.Request) {
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleLogin(w, r)
+}
+
+func (state *runtimeStore) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -203,17 +224,17 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
+	state.mu.Lock()
 	emailKey := strings.ToLower(strings.TrimSpace(req.Email))
-	if _, exists := users[emailKey]; exists {
-		mu.Unlock()
+	if _, exists := state.users[emailKey]; exists {
+		state.mu.Unlock()
 		writeError(w, http.StatusConflict, "An account with that email already exists")
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		mu.Unlock()
+		state.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, "Could not create account")
 		return
 	}
@@ -223,8 +244,8 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		Email:    req.Email,
 		Password: string(hash),
 	}
-	users[emailKey] = user
-	mu.Unlock()
+	state.users[emailKey] = user
+	state.mu.Unlock()
 
 	token, err := issueToken(user)
 	if err != nil {
@@ -234,13 +255,19 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
 }
 
-func handleMe(w http.ResponseWriter, r *http.Request) {
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRegister(w, r)
+}
+
+func (state *runtimeStore) handleMe(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	if email == "" {
 		writeError(w, http.StatusUnauthorized, "Invalid token claims")
 		return
 	}
-	user, ok := findUserByEmail(email)
+	user, ok := state.findUserByEmail(email)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "User not found")
 		return
@@ -248,7 +275,13 @@ func handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, userResponse{User: user})
 }
 
-func handleUpdateMe(w http.ResponseWriter, r *http.Request) {
+func handleMe(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleMe(w, r)
+}
+
+func (state *runtimeStore) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 	oldEmail, _ := r.Context().Value(ctxUserEmail).(string)
 	if oldEmail == "" {
 		writeError(w, http.StatusUnauthorized, "Invalid token claims")
@@ -280,17 +313,17 @@ func handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 
 	oldKey := strings.ToLower(strings.TrimSpace(oldEmail))
 
-	mu.Lock()
-	user, ok := users[oldKey]
+	state.mu.Lock()
+	user, ok := state.users[oldKey]
 	if !ok {
-		mu.Unlock()
+		state.mu.Unlock()
 		writeError(w, http.StatusUnauthorized, "User not found")
 		return
 	}
 
 	if email != oldKey {
-		if _, taken := users[email]; taken {
-			mu.Unlock()
+		if _, taken := state.users[email]; taken {
+			state.mu.Unlock()
 			writeFieldErrors(w, map[string]string{"email": "That email is already in use"})
 			return
 		}
@@ -301,33 +334,33 @@ func handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 	user.Email = email
 
 	if email != oldKey {
-		delete(users, oldKey)
+		delete(state.users, oldKey)
 	}
-	users[email] = user
-	mu.Unlock()
+	state.users[email] = user
+	state.mu.Unlock()
 
-	mu.Lock()
-	for i := range contacts {
-		if contacts[i].Owner == oldName && canWrite(contacts[i].RecordScope, user) {
-			contacts[i].Owner = name
+	state.mu.Lock()
+	for i := range state.contacts {
+		if state.contacts[i].Owner == oldName && canWrite(state.contacts[i].RecordScope, user) {
+			state.contacts[i].Owner = name
 		}
 	}
-	for i := range deals {
-		if deals[i].Owner == oldName && canWrite(deals[i].RecordScope, user) {
-			deals[i].Owner = name
+	for i := range state.deals {
+		if state.deals[i].Owner == oldName && canWrite(state.deals[i].RecordScope, user) {
+			state.deals[i].Owner = name
 		}
 	}
-	for i := range tasks {
-		if tasks[i].Owner == oldName && canWrite(tasks[i].RecordScope, user) {
-			tasks[i].Owner = name
+	for i := range state.tasks {
+		if state.tasks[i].Owner == oldName && canWrite(state.tasks[i].RecordScope, user) {
+			state.tasks[i].Owner = name
 		}
 	}
-	for i := range activities {
-		if activities[i].CreatedBy == oldName && canWrite(activities[i].RecordScope, user) {
-			activities[i].CreatedBy = name
+	for i := range state.activities {
+		if state.activities[i].CreatedBy == oldName && canWrite(state.activities[i].RecordScope, user) {
+			state.activities[i].CreatedBy = name
 		}
 	}
-	mu.Unlock()
+	state.mu.Unlock()
 
 	token, err := issueToken(user)
 	if err != nil {
@@ -344,7 +377,13 @@ func handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, profileUpdateResponse{Token: token, User: user})
 }
 
-func handleChangePassword(w http.ResponseWriter, r *http.Request) {
+func handleUpdateMe(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleUpdateMe(w, r)
+}
+
+func (state *runtimeStore) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	if email == "" {
 		writeError(w, http.StatusUnauthorized, "Invalid token claims")
@@ -371,10 +410,10 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 
 	emailKey := strings.ToLower(strings.TrimSpace(email))
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	user, ok := users[emailKey]
+	user, ok := state.users[emailKey]
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "User not found")
 		return
@@ -390,7 +429,7 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	user.Password = string(hash)
 	user.SessionVersion++
-	users[emailKey] = user
+	state.users[emailKey] = user
 	if err := mintSession(w, r, user, true); err != nil {
 		writeError(w, 500, "Could not refresh session")
 		return
@@ -399,7 +438,13 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
-func handleLogoutAll(w http.ResponseWriter, r *http.Request) {
+func handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleChangePassword(w, r)
+}
+
+func (state *runtimeStore) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	jti, _ := r.Context().Value(ctxTokenID).(string)
 	if email == "" {
@@ -407,18 +452,24 @@ func handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
+	state.mu.Lock()
 	key := strings.ToLower(strings.TrimSpace(email))
-	user, exists := users[key]
+	user, exists := state.users[key]
 	if exists {
 		user.SessionVersion++
-		users[key] = user
+		state.users[key] = user
 	}
-	mu.Unlock()
+	state.mu.Unlock()
 
 	if jti != "" {
-		revokeToken(jti, time.Now().Add(24*time.Hour))
+		state.revokeToken(jti, time.Now().Add(24*time.Hour))
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func handleLogoutAll(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleLogoutAll(w, r)
 }

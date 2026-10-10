@@ -22,7 +22,7 @@ type contactRequest struct {
 var validStages = []string{"Lead", "Qualified", "Proposal", "Customer"}
 
 // validateContact must be called with mu held (read or write).
-func validateContact(req contactRequest, excludeID string) map[string]string {
+func (state *runtimeStore) validateContact(req contactRequest, excludeID string) map[string]string {
 	fields := map[string]string{}
 
 	name := strings.TrimSpace(req.Name)
@@ -40,7 +40,7 @@ func validateContact(req contactRequest, excludeID string) map[string]string {
 	} else if !strings.Contains(email, "@") || !strings.Contains(email, ".") {
 		fields["email"] = "Please enter a valid email"
 	} else {
-		for _, c := range contacts {
+		for _, c := range state.contacts {
 			if strings.EqualFold(c.Email, email) && c.ID != excludeID {
 				fields["email"] = "A contact with this email already exists"
 				break
@@ -64,6 +64,12 @@ func validateContact(req contactRequest, excludeID string) map[string]string {
 	return fields
 }
 
+func validateContact(req contactRequest, excludeID string) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateContact(req, excludeID)
+}
+
 func writeFieldErrors(w http.ResponseWriter, fields map[string]string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
@@ -73,15 +79,15 @@ func writeFieldErrors(w http.ResponseWriter, fields map[string]string) {
 	})
 }
 
-func listContacts(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listContacts(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	mu.RLock()
-	defer mu.RUnlock()
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 
-	filtered := make([]Contact, 0, len(contacts))
-	for _, c := range contacts {
+	filtered := make([]Contact, 0, len(state.contacts))
+	for _, c := range state.contacts {
 		if q == "" ||
 			strings.Contains(strings.ToLower(c.Name), q) ||
 			strings.Contains(strings.ToLower(c.Email), q) ||
@@ -99,13 +105,19 @@ func listContacts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getContact(w http.ResponseWriter, r *http.Request) {
+func listContacts(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listContacts(w, r)
+}
+
+func (state *runtimeStore) getContact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.RLock()
-	defer mu.RUnlock()
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 
-	for _, c := range contacts {
+	for _, c := range state.contacts {
 		if c.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"contact": c})
 			return
@@ -114,17 +126,23 @@ func getContact(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Contact not found")
 }
 
-func createContact(w http.ResponseWriter, r *http.Request) {
+func getContact(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getContact(w, r)
+}
+
+func (state *runtimeStore) createContact(w http.ResponseWriter, r *http.Request) {
 	var req contactRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	if fields := validateContact(req, ""); len(fields) > 0 {
+	if fields := state.validateContact(req, ""); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -156,19 +174,25 @@ func createContact(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   now,
 	}
 
-	contacts = append(contacts, newContact)
+	state.contacts = append(state.contacts, newContact)
 
 	writeJSON(w, http.StatusCreated, map[string]any{"contact": newContact})
 }
 
-func updateContact(w http.ResponseWriter, r *http.Request) {
+func createContact(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createContact(w, r)
+}
+
+func (state *runtimeStore) updateContact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, c := range contacts {
+	for i, c := range state.contacts {
 		if c.ID == id {
 			idx = i
 			break
@@ -185,7 +209,7 @@ func updateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if fields := validateContact(req, id); len(fields) > 0 {
+	if fields := state.validateContact(req, id); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -195,7 +219,7 @@ func updateContact(w http.ResponseWriter, r *http.Request) {
 		tags = []string{}
 	}
 
-	updated := contacts[idx]
+	updated := state.contacts[idx]
 	updated.Name = strings.TrimSpace(req.Name)
 	updated.Email = strings.TrimSpace(req.Email)
 	updated.Company = strings.TrimSpace(req.Company)
@@ -209,19 +233,25 @@ func updateContact(w http.ResponseWriter, r *http.Request) {
 		updated.Stage = stage
 	}
 
-	contacts[idx] = updated
+	state.contacts[idx] = updated
 
 	writeJSON(w, http.StatusOK, map[string]any{"contact": updated})
 }
 
-func deleteContact(w http.ResponseWriter, r *http.Request) {
+func updateContact(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateContact(w, r)
+}
+
+func (state *runtimeStore) deleteContact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, c := range contacts {
+	for i, c := range state.contacts {
 		if c.ID == id {
 			idx = i
 			break
@@ -232,30 +262,36 @@ func deleteContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contacts = append(contacts[:idx], contacts[idx+1:]...)
+	state.contacts = append(state.contacts[:idx], state.contacts[idx+1:]...)
 
-	keptActivities := activities[:0]
-	for _, a := range activities {
+	keptActivities := state.activities[:0]
+	for _, a := range state.activities {
 		if a.ContactID != id {
 			keptActivities = append(keptActivities, a)
 		}
 	}
-	activities = keptActivities
+	state.activities = keptActivities
 
-	keptTasks := tasks[:0]
-	for _, t := range tasks {
+	keptTasks := state.tasks[:0]
+	for _, t := range state.tasks {
 		if t.ContactID != id {
 			keptTasks = append(keptTasks, t)
 		}
 	}
-	tasks = keptTasks
+	state.tasks = keptTasks
 
-	for i := range deals {
-		if deals[i].ContactID == id {
-			deals[i].ContactID = ""
-			deals[i].ContactName = ""
+	for i := range state.deals {
+		if state.deals[i].ContactID == id {
+			state.deals[i].ContactID = ""
+			state.deals[i].ContactName = ""
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteContact(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteContact(w, r)
 }

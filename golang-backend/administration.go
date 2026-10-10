@@ -46,11 +46,11 @@ func checkUserAccessVersion(w http.ResponseWriter, r *http.Request, user User) b
 	return true
 }
 
-func adminTarget(w http.ResponseWriter, r *http.Request) (User, bool) {
+func (state *runtimeStore) adminTarget(w http.ResponseWriter, r *http.Request) (User, bool) {
 	if !requireAdmin(w, r) {
 		return User{}, false
 	}
-	user, ok := findUserByID(r.PathValue("user"))
+	user, ok := state.findUserByID(r.PathValue("user"))
 	if !ok || user.OrgID != currentUser(r).OrgID {
 		writeError(w, 404, "User not found")
 		return User{}, false
@@ -58,7 +58,13 @@ func adminTarget(w http.ResponseWriter, r *http.Request) (User, bool) {
 	return user, checkUserAccessVersion(w, r, user)
 }
 
-func handleSystemAdministration(w http.ResponseWriter, r *http.Request) {
+func adminTarget(w http.ResponseWriter, r *http.Request) (User, bool) {
+	state, release := runtimeForCall(r)
+	defer release()
+	return state.adminTarget(w, r)
+}
+
+func (state *runtimeStore) handleSystemAdministration(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
@@ -85,7 +91,7 @@ func handleSystemAdministration(w http.ResponseWriter, r *http.Request) {
 		}
 		if key == "users" {
 			for _, row := range rows {
-				account, exists := findUserByID(fmt.Sprint(row["id"]))
+				account, exists := state.findUserByID(fmt.Sprint(row["id"]))
 				if !exists {
 					continue
 				}
@@ -109,24 +115,36 @@ func handleSystemAdministration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, result)
 }
 
-func invalidateUserSessions(r *http.Request, target *User) error {
+func handleSystemAdministration(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSystemAdministration(w, r)
+}
+
+func (state *runtimeStore) invalidateUserSessions(r *http.Request, target *User) error {
 	if _, err := storeDB(r).Exec("UPDATE sessions SET revoked_at=? WHERE user_id=? AND org_id=? AND revoked_at IS NULL", utcNow(), target.ID, target.OrgID); err != nil {
 		return err
 	}
 	// Version changes also revoke bearer tokens and refresh credentials.
 	target.SessionVersion++
-	mu.Lock()
-	users[strings.ToLower(target.Email)] = *target
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[strings.ToLower(target.Email)] = *target
+	state.mu.Unlock()
 	return nil
 }
 
-func handleAdminRevokeSessions(w http.ResponseWriter, r *http.Request) {
-	target, ok := adminTarget(w, r)
+func invalidateUserSessions(r *http.Request, target *User) error {
+	state, release := runtimeForCall(r)
+	defer release()
+	return state.invalidateUserSessions(r, target)
+}
+
+func (state *runtimeStore) handleAdminRevokeSessions(w http.ResponseWriter, r *http.Request) {
+	target, ok := state.adminTarget(w, r)
 	if !ok {
 		return
 	}
-	if err := invalidateUserSessions(r, &target); err != nil {
+	if err := state.invalidateUserSessions(r, &target); err != nil {
 		writeError(w, 500, "Could not revoke sessions")
 		return
 	}
@@ -137,14 +155,20 @@ func handleAdminRevokeSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, statusResponse{"ok"})
 }
 
+func handleAdminRevokeSessions(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleAdminRevokeSessions(w, r)
+}
+
 func pendingUserInvitation(r *http.Request, target User) (bool, error) {
 	var count int
 	err := storeDB(r).QueryRow("SELECT COUNT(*) FROM auth_tokens WHERE user_id=? AND purpose='invite' AND used_at IS NULL", target.ID).Scan(&count)
 	return count > 0, err
 }
 
-func handleAdminInvitation(w http.ResponseWriter, r *http.Request) {
-	target, ok := adminTarget(w, r)
+func (state *runtimeStore) handleAdminInvitation(w http.ResponseWriter, r *http.Request) {
+	target, ok := state.adminTarget(w, r)
 	if !ok {
 		return
 	}
@@ -160,8 +184,14 @@ func handleAdminInvitation(w http.ResponseWriter, r *http.Request) {
 	issueAdminAccessLink(w, r, target, "invite", 72*time.Hour)
 }
 
-func handleAdminPasswordReset(w http.ResponseWriter, r *http.Request) {
-	target, ok := adminTarget(w, r)
+func handleAdminInvitation(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleAdminInvitation(w, r)
+}
+
+func (state *runtimeStore) handleAdminPasswordReset(w http.ResponseWriter, r *http.Request) {
+	target, ok := state.adminTarget(w, r)
 	if !ok {
 		return
 	}
@@ -170,6 +200,12 @@ func handleAdminPasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	issueAdminAccessLink(w, r, target, "reset", 30*time.Minute)
+}
+
+func handleAdminPasswordReset(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleAdminPasswordReset(w, r)
 }
 
 func issueAdminAccessLink(w http.ResponseWriter, r *http.Request, target User, purpose string, ttl time.Duration) {

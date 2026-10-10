@@ -24,9 +24,9 @@ var validAcceptanceStatuses = []string{"Pending", "Accepted", "Rejected", "Waitl
 var validVisaStatuses = []string{"Not Started", "Pending", "Approved", "Denied"}
 var validInvoiceStatuses = []string{"Not Issued", "Issued", "Paid", "Overdue"}
 
-func linkedStudentCounts() (map[string]int, map[string]int) {
+func (state *runtimeStore) linkedStudentCounts() (map[string]int, map[string]int) {
 	agents, schools := map[string]int{}, map[string]int{}
-	for _, student := range listStudents() {
+	for _, student := range state.listStudents() {
 		if student.AgentID != "" {
 			agents[student.AgentID]++
 		}
@@ -35,6 +35,12 @@ func linkedStudentCounts() (map[string]int, map[string]int) {
 		}
 	}
 	return agents, schools
+}
+
+func linkedStudentCounts() (map[string]int, map[string]int) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.linkedStudentCounts()
 }
 
 func isValidAcceptanceStatus(s string) bool {
@@ -64,7 +70,7 @@ func isValidInvoiceStatus(s string) bool {
 	return false
 }
 
-func validateStudent(req studentRequest) map[string]string {
+func (state *runtimeStore) validateStudent(req studentRequest) map[string]string {
 	fields := map[string]string{}
 
 	name := strings.TrimSpace(req.Name)
@@ -99,13 +105,13 @@ func validateStudent(req studentRequest) map[string]string {
 	}
 
 	if schoolID != "" {
-		if _, ok := getSchoolByID(schoolID); !ok {
+		if _, ok := state.getSchoolByID(schoolID); !ok {
 			fields["schoolId"] = "School not found"
 		}
 	}
 
 	if agentID != "" {
-		if _, ok := getAgentByID(agentID); !ok {
+		if _, ok := state.getAgentByID(agentID); !ok {
 			fields["agentId"] = "Agent not found"
 		}
 	}
@@ -113,13 +119,19 @@ func validateStudent(req studentRequest) map[string]string {
 	return fields
 }
 
-func listStudentsHandler(w http.ResponseWriter, r *http.Request) {
+func validateStudent(req studentRequest) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateStudent(req)
+}
+
+func (state *runtimeStore) listStudentsHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	agentID := strings.TrimSpace(r.URL.Query().Get("agentId"))
 	schoolID := strings.TrimSpace(r.URL.Query().Get("schoolId"))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listStudents()
+	all := state.listStudents()
 	filtered := make([]Student, 0, len(all))
 	for _, s := range all {
 		if (agentID != "" && s.AgentID != agentID) || (schoolID != "" && s.SchoolID != schoolID) {
@@ -144,9 +156,15 @@ func listStudentsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getStudentHandler(w http.ResponseWriter, r *http.Request) {
+func listStudentsHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listStudentsHandler(w, r)
+}
+
+func (state *runtimeStore) getStudentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s, ok := getStudentByID(id)
+	s, ok := state.getStudentByID(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Student not found")
 		return
@@ -154,13 +172,19 @@ func getStudentHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"student": s})
 }
 
-func createStudentHandler(w http.ResponseWriter, r *http.Request) {
+func getStudentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getStudentHandler(w, r)
+}
+
+func (state *runtimeStore) createStudentHandler(w http.ResponseWriter, r *http.Request) {
 	var req studentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if fields := validateStudent(req); len(fields) > 0 {
+	if fields := state.validateStudent(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -168,7 +192,7 @@ func createStudentHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
@@ -176,7 +200,7 @@ func createStudentHandler(w http.ResponseWriter, r *http.Request) {
 	schoolID := strings.TrimSpace(req.SchoolID)
 	schoolName := ""
 	if schoolID != "" {
-		if sch, ok := getSchoolByID(schoolID); ok {
+		if sch, ok := state.getSchoolByID(schoolID); ok {
 			schoolName = sch.Name
 		}
 	}
@@ -184,7 +208,7 @@ func createStudentHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := strings.TrimSpace(req.AgentID)
 	agentName := ""
 	if agentID != "" {
-		if a, ok := getAgentByID(agentID); ok {
+		if a, ok := state.getAgentByID(agentID); ok {
 			agentName = a.Name
 		}
 	}
@@ -209,14 +233,20 @@ func createStudentHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        now,
 	}
 
-	mu.Lock()
-	students = append(students, newStudent)
-	mu.Unlock()
+	state.mu.Lock()
+	state.students = append(state.students, newStudent)
+	state.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"student": newStudent})
 }
 
-func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
+func createStudentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createStudentHandler(w, r)
+}
+
+func (state *runtimeStore) updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req studentRequest
@@ -224,7 +254,7 @@ func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if fields := validateStudent(req); len(fields) > 0 {
+	if fields := state.validateStudent(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -232,7 +262,7 @@ func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 	schoolID := strings.TrimSpace(req.SchoolID)
 	schoolName := ""
 	if schoolID != "" {
-		if sch, ok := getSchoolByID(schoolID); ok {
+		if sch, ok := state.getSchoolByID(schoolID); ok {
 			schoolName = sch.Name
 		}
 	}
@@ -240,16 +270,16 @@ func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := strings.TrimSpace(req.AgentID)
 	agentName := ""
 	if agentID != "" {
-		if a, ok := getAgentByID(agentID); ok {
+		if a, ok := state.getAgentByID(agentID); ok {
 			agentName = a.Name
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, s := range students {
+	for i, s := range state.students {
 		if s.ID == id {
 			idx = i
 			break
@@ -260,7 +290,7 @@ func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := students[idx]
+	updated := state.students[idx]
 	updated.Name = strings.TrimSpace(req.Name)
 	updated.StudentCode = strings.TrimSpace(req.StudentCode)
 	updated.CountryCode = strings.TrimSpace(strings.ToUpper(req.CountryCode))
@@ -274,18 +304,24 @@ func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
 	updated.InvoiceStatus = strings.TrimSpace(req.InvoiceStatus)
 	updated.Notes = req.Notes
 
-	students[idx] = updated
+	state.students[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"student": updated})
 }
 
-func deleteStudentHandler(w http.ResponseWriter, r *http.Request) {
+func updateStudentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateStudentHandler(w, r)
+}
+
+func (state *runtimeStore) deleteStudentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, s := range students {
+	for i, s := range state.students {
 		if s.ID == id {
 			idx = i
 			break
@@ -296,6 +332,12 @@ func deleteStudentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	students = append(students[:idx], students[idx+1:]...)
+	state.students = append(state.students[:idx], state.students[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteStudentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteStudentHandler(w, r)
 }

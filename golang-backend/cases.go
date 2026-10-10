@@ -64,8 +64,8 @@ func isValidCasePriority(s string) bool {
 }
 
 // findCaseByID must be called with mu held.
-func findCaseByID(id string) (Case, bool) {
-	for _, c := range cases {
+func (state *runtimeStore) findCaseByID(id string) (Case, bool) {
+	for _, c := range state.cases {
 		if c.ID == id {
 			return c, true
 		}
@@ -73,8 +73,14 @@ func findCaseByID(id string) (Case, bool) {
 	return Case{}, false
 }
 
+func findCaseByID(id string) (Case, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.findCaseByID(id)
+}
+
 // validateCase must be called with mu held.
-func validateCase(req caseRequest) map[string]string {
+func (state *runtimeStore) validateCase(req caseRequest) map[string]string {
 	fields := map[string]string{}
 
 	clientID := strings.TrimSpace(req.ClientID)
@@ -84,7 +90,7 @@ func validateCase(req caseRequest) map[string]string {
 
 	if clientID == "" {
 		fields["clientId"] = "Client is required"
-	} else if _, ok := findContactByID(clientID); !ok {
+	} else if _, ok := state.findContactByID(clientID); !ok {
 		fields["clientId"] = "Client not found"
 	}
 
@@ -107,13 +113,19 @@ func validateCase(req caseRequest) map[string]string {
 	return fields
 }
 
-func listCasesHandler(w http.ResponseWriter, r *http.Request) {
+func validateCase(req caseRequest) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateCase(req)
+}
+
+func (state *runtimeStore) listCasesHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	stage := strings.TrimSpace(r.URL.Query().Get("stage"))
 	clientID := strings.TrimSpace(r.URL.Query().Get("clientId"))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listCases()
+	all := state.listCases()
 	filtered := make([]Case, 0, len(all))
 	for _, c := range all {
 		if stage != "" && c.CurrentStage != stage {
@@ -141,11 +153,17 @@ func listCasesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getCaseHandler(w http.ResponseWriter, r *http.Request) {
+func listCasesHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listCasesHandler(w, r)
+}
+
+func (state *runtimeStore) getCaseHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, c := range cases {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, c := range state.cases {
 		if c.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"case": c})
 			return
@@ -154,7 +172,13 @@ func getCaseHandler(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Case not found")
 }
 
-func createCaseHandler(w http.ResponseWriter, r *http.Request) {
+func getCaseHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getCaseHandler(w, r)
+}
+
+func (state *runtimeStore) createCaseHandler(w http.ResponseWriter, r *http.Request) {
 	var req caseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -164,22 +188,22 @@ func createCaseHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	if fields := validateCase(req); len(fields) > 0 {
+	if fields := state.validateCase(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
 
 	clientID := strings.TrimSpace(req.ClientID)
 	clientName := ""
-	if c, ok := findContactByID(clientID); ok {
+	if c, ok := state.findContactByID(clientID); ok {
 		clientName = c.Name
 	}
 
@@ -217,11 +241,17 @@ func createCaseHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:          now,
 	}
 
-	cases = append(cases, newCase)
+	state.cases = append(state.cases, newCase)
 	writeJSON(w, http.StatusCreated, map[string]any{"case": newCase})
 }
 
-func updateCaseHandler(w http.ResponseWriter, r *http.Request) {
+func createCaseHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createCaseHandler(w, r)
+}
+
+func (state *runtimeStore) updateCaseHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req caseRequest
@@ -230,11 +260,11 @@ func updateCaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, c := range cases {
+	for i, c := range state.cases {
 		if c.ID == id {
 			idx = i
 			break
@@ -245,18 +275,18 @@ func updateCaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if fields := validateCase(req); len(fields) > 0 {
+	if fields := state.validateCase(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
 
 	clientID := strings.TrimSpace(req.ClientID)
 	clientName := ""
-	if c, ok := findContactByID(clientID); ok {
+	if c, ok := state.findContactByID(clientID); ok {
 		clientName = c.Name
 	}
 
-	updated := cases[idx]
+	updated := state.cases[idx]
 	updated.CaseNumber = strings.TrimSpace(req.CaseNumber)
 	updated.ClientID = clientID
 	updated.ClientName = clientName
@@ -278,11 +308,17 @@ func updateCaseHandler(w http.ResponseWriter, r *http.Request) {
 	updated.ClosureDate = strings.TrimSpace(req.ClosureDate)
 	updated.Notes = req.Notes
 
-	cases[idx] = updated
+	state.cases[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"case": updated})
 }
 
-func updateCaseStageHandler(w http.ResponseWriter, r *http.Request) {
+func updateCaseHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateCaseHandler(w, r)
+}
+
+func (state *runtimeStore) updateCaseStageHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req caseStageRequest
@@ -291,11 +327,11 @@ func updateCaseStageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, c := range cases {
+	for i, c := range state.cases {
 		if c.ID == id {
 			idx = i
 			break
@@ -312,18 +348,24 @@ func updateCaseStageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cases[idx].CurrentStage = stage
-	writeJSON(w, http.StatusOK, map[string]any{"case": cases[idx]})
+	state.cases[idx].CurrentStage = stage
+	writeJSON(w, http.StatusOK, map[string]any{"case": state.cases[idx]})
 }
 
-func deleteCaseHandler(w http.ResponseWriter, r *http.Request) {
+func updateCaseStageHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateCaseStageHandler(w, r)
+}
+
+func (state *runtimeStore) deleteCaseHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, c := range cases {
+	for i, c := range state.cases {
 		if c.ID == id {
 			idx = i
 			break
@@ -334,15 +376,21 @@ func deleteCaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cases = append(cases[:idx], cases[idx+1:]...)
+	state.cases = append(state.cases[:idx], state.cases[idx+1:]...)
 
-	keptDocs := documents[:0]
-	for _, d := range documents {
+	keptDocs := state.documents[:0]
+	for _, d := range state.documents {
 		if d.CaseID != id {
 			keptDocs = append(keptDocs, d)
 		}
 	}
-	documents = keptDocs
+	state.documents = keptDocs
 
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteCaseHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteCaseHandler(w, r)
 }

@@ -20,7 +20,15 @@
         const revision = (frozen || revisions).get(decodeURIComponent(match[2]));
         if (revision) this.setRequestHeader('If-Match', revision);
       }
-      this.addEventListener('load', () => { if (this.status >= 200 && this.status < 300) { try { observe(JSON.parse(this.responseText)); } catch {} } });
+      // Capture before the application's load callback can open an edit dialog.
+      this.addEventListener('readystatechange', () => {
+        if (this.readyState === 4 && this.status >= 200 && this.status < 300) {
+          try { observe(this.responseType === 'json' ? this.response : JSON.parse(this.responseText)); } catch {}
+          if (['POST','PUT','PATCH','DELETE'].includes(this.crmMethod) && /^\/api\/(contacts|deals|tasks|schools|students|agents|leads|cases|documents|invoices|payments|partners|activities)(?:\/|$)/.test(this.crmURL.pathname)) {
+            window.dispatchEvent(new CustomEvent('crm:record-changed', {detail: match ? decodeURIComponent(match[2]) : ''}));
+          }
+        }
+      });
     }
     return originalSend.call(this, body);
   };

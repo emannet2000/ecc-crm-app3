@@ -273,6 +273,7 @@ homeView model user =
                     model.today ++ " · Here's what's happening across your workspace today."
                 )
             ]
+        , Html.node "crm-my-work" [] []
         , Html.node "crm-ai-productivity" [] []
         , div [ class "stats" ]
             [ statCard "Deals"
@@ -326,10 +327,5 @@ homeView model user =
             , barChart (barData model)
             ]
         , activityHeatmap model.today (allCreatedAt model)
-        , Html.node "crm-insights" [ Attr.attribute "mode" "dashboard" ] []
-        , p [ class "chart-card__subtitle" ] [ text "The activity and alert previews below show loaded records. The action queue above covers all accessible records." ]
-        , div [ class "bottom-row" ]
-            [ alertsPanel (priorityAlerts model)
-            , activityPanel (recentEntries model)
-            ]
+        , Html.node "crm-recent-changes" [] []
         ]

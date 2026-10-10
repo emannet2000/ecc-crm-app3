@@ -27,12 +27,14 @@ type invoiceRequest struct {
 }
 
 type paymentRequest struct {
-	InvoiceID string  `json:"invoiceId"`
-	Amount    float64 `json:"amount"`
-	PaidOn    string  `json:"paidOn"`
-	Method    string  `json:"method"`
-	Reference string  `json:"reference"`
-	Notes     string  `json:"notes"`
+	RequireApproval  bool    `json:"requireApproval"`
+	ConfirmDuplicate bool    `json:"confirmDuplicate"`
+	InvoiceID        string  `json:"invoiceId"`
+	Amount           float64 `json:"amount"`
+	PaidOn           string  `json:"paidOn"`
+	Method           string  `json:"method"`
+	Reference        string  `json:"reference"`
+	Notes            string  `json:"notes"`
 }
 
 type refundRequest struct {
@@ -55,7 +57,7 @@ func isValidPaymentMilestone(s string) bool {
 }
 
 // validateInvoice must be called with mu held.
-func validateInvoice(req invoiceRequest) map[string]string {
+func (state *runtimeStore) validateInvoice(req invoiceRequest) map[string]string {
 	fields := map[string]string{}
 
 	clientID := strings.TrimSpace(req.ClientID)
@@ -63,7 +65,7 @@ func validateInvoice(req invoiceRequest) map[string]string {
 
 	if clientID == "" {
 		fields["clientId"] = "Client is required"
-	} else if _, ok := findContactByID(clientID); !ok {
+	} else if _, ok := state.findContactByID(clientID); !ok {
 		fields["clientId"] = "Client not found"
 	}
 
@@ -89,15 +91,21 @@ func validateInvoice(req invoiceRequest) map[string]string {
 	return fields
 }
 
+func validateInvoice(req invoiceRequest) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateInvoice(req)
+}
+
 // ================= INVOICES =================
 
-func listInvoicesHandler(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listInvoicesHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	clientID := strings.TrimSpace(r.URL.Query().Get("clientId"))
 	milestone := strings.TrimSpace(r.URL.Query().Get("milestone"))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listInvoices()
+	all := state.listInvoices()
 	filtered := make([]Invoice, 0, len(all))
 	for _, inv := range all {
 		if clientID != "" && inv.ClientID != clientID {
@@ -123,11 +131,17 @@ func listInvoicesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+func listInvoicesHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listInvoicesHandler(w, r)
+}
+
+func (state *runtimeStore) getInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, inv := range invoices {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, inv := range state.invoices {
 		if inv.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"invoice": inv})
 			return
@@ -136,7 +150,13 @@ func getInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Invoice not found")
 }
 
-func createInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+func getInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getInvoiceHandler(w, r)
+}
+
+func (state *runtimeStore) createInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	var req invoiceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -146,28 +166,28 @@ func createInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	if fields := validateInvoice(req); len(fields) > 0 {
+	if fields := state.validateInvoice(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
 
 	clientID := strings.TrimSpace(req.ClientID)
 	clientName := ""
-	if c, ok := findContactByID(clientID); ok {
+	if c, ok := state.findContactByID(clientID); ok {
 		clientName = c.Name
 	}
 
 	caseID := strings.TrimSpace(req.CaseID)
 	caseNumber := ""
-	if c, ok := findCaseByID(caseID); ok {
+	if c, ok := state.findCaseByID(caseID); ok {
 		caseNumber = c.CaseNumber
 	}
 
@@ -206,11 +226,17 @@ func createInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:             now,
 	}
 
-	invoices = append(invoices, newInv)
+	state.invoices = append(state.invoices, newInv)
 	writeJSON(w, http.StatusCreated, map[string]any{"invoice": newInv})
 }
 
-func updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+func createInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createInvoiceHandler(w, r)
+}
+
+func (state *runtimeStore) updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req invoiceRequest
@@ -219,11 +245,11 @@ func updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, inv := range invoices {
+	for i, inv := range state.invoices {
 		if inv.ID == id {
 			idx = i
 			break
@@ -234,27 +260,27 @@ func updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if fields := validateInvoice(req); len(fields) > 0 {
+	if fields := state.validateInvoice(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
 
 	clientID := strings.TrimSpace(req.ClientID)
 	clientName := ""
-	if c, ok := findContactByID(clientID); ok {
+	if c, ok := state.findContactByID(clientID); ok {
 		clientName = c.Name
 	}
 
 	caseID := strings.TrimSpace(req.CaseID)
 	caseNumber := ""
-	if c, ok := findCaseByID(caseID); ok {
+	if c, ok := state.findCaseByID(caseID); ok {
 		caseNumber = c.CaseNumber
 	}
 
 	totalDue := req.TotalFee + req.GovernmentFee + req.SchoolPartnerFee
 	balance := totalDue - req.AmountReceived
 
-	updated := invoices[idx]
+	updated := state.invoices[idx]
 	updated.InvoiceNumber = strings.TrimSpace(req.InvoiceNumber)
 	updated.ClientID = clientID
 	updated.ClientName = clientName
@@ -264,25 +290,31 @@ func updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	updated.GovernmentFee = req.GovernmentFee
 	updated.SchoolPartnerFee = req.SchoolPartnerFee
 	// Receipt amounts are controlled by the ledger.
-	updated.AmountReceived = invoices[idx].AmountReceived
+	updated.AmountReceived = state.invoices[idx].AmountReceived
 	updated.Balance = balance
 	updated.PaymentMilestone = strings.TrimSpace(req.PaymentMilestone)
 	updated.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
 	updated.OfficialReceiptNumber = strings.TrimSpace(req.OfficialReceiptNumber)
 	// Refund state is managed by the approval and processing workflow.
- updated.RefundStatus = invoices[idx].RefundStatus
+	updated.RefundStatus = state.invoices[idx].RefundStatus
 	updated.ReferralCommission = req.ReferralCommission
 	updated.PartnerPayable = req.PartnerPayable
 	updated.PaymentApproval = strings.TrimSpace(req.PaymentApproval)
 	updated.Notes = req.Notes
 
-	invoices[idx] = updated
-	recomputeInvoiceLocked(idx)
-	updated = invoices[idx]
+	state.invoices[idx] = updated
+	state.recomputeInvoiceLocked(idx)
+	updated = state.invoices[idx]
 	writeJSON(w, http.StatusOK, map[string]any{"invoice": updated})
 }
 
-func requestRefundHandler(w http.ResponseWriter, r *http.Request) {
+func updateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateInvoiceHandler(w, r)
+}
+
+func (state *runtimeStore) requestRefundHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req refundRequest
@@ -297,11 +329,11 @@ func requestRefundHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, inv := range invoices {
+	for i, inv := range state.invoices {
 		if inv.ID == id {
 			idx = i
 			break
@@ -314,31 +346,37 @@ func requestRefundHandler(w http.ResponseWriter, r *http.Request) {
 
 	amount := req.Amount
 	if amount == 0 {
-		amount = invoices[idx].AmountReceived
+		amount = state.invoices[idx].AmountReceived
 	}
-	if amount <= 0 || amount > invoices[idx].AmountReceived {
+	if amount <= 0 || amount > state.invoices[idx].AmountReceived {
 		writeError(w, 400, "Refund cannot exceed the amount received")
 		return
 	}
-	if _, err := entry(r, "refund", id, map[string]any{"amount": money(amount), "currency": currencyOf(invoices[idx].Currency), "reason": reason, "status": "requested", "requestedBy": currentUser(r).ID}, false); err != nil {
+	if _, err := entry(r, "refund", id, map[string]any{"amount": money(amount), "currency": currencyOf(state.invoices[idx].Currency), "reason": reason, "status": "requested", "requestedBy": currentUser(r).ID}, false); err != nil {
 		writeError(w, 500, "Could not save refund request")
 		return
 	}
-	invoices[idx].RefundStatus = "Requested"
-	invoices[idx].PaymentMilestone = "Refund Review"
-	invoices[idx].Notes = invoices[idx].Notes + "\n[Refund requested] " + reason
+	state.invoices[idx].RefundStatus = "Requested"
+	state.invoices[idx].PaymentMilestone = "Refund Review"
+	state.invoices[idx].Notes = state.invoices[idx].Notes + "\n[Refund requested] " + reason
 
-	writeJSON(w, http.StatusOK, map[string]any{"invoice": invoices[idx]})
+	writeJSON(w, http.StatusOK, map[string]any{"invoice": state.invoices[idx]})
 }
 
-func deleteInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+func requestRefundHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.requestRefundHandler(w, r)
+}
+
+func (state *runtimeStore) deleteInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, inv := range invoices {
+	for i, inv := range state.invoices {
 		if inv.ID == id {
 			idx = i
 			break
@@ -349,23 +387,29 @@ func deleteInvoiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, p := range payments {
+	for _, p := range state.payments {
 		if p.InvoiceID == id {
 			writeError(w, 409, "Invoices with payments must be retained for the ledger")
 			return
 		}
 	}
-	invoices = append(invoices[:idx], invoices[idx+1:]...)
+	state.invoices = append(state.invoices[:idx], state.invoices[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteInvoiceHandler(w, r)
 }
 
 // ================= PAYMENTS =================
 
-func listPaymentsHandler(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listPaymentsHandler(w http.ResponseWriter, r *http.Request) {
 	invoiceID := strings.TrimSpace(r.URL.Query().Get("invoiceId"))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listPayments()
+	all := state.listPayments()
 	filtered := make([]Payment, 0, len(all))
 	for _, p := range all {
 		if invoiceID != "" && p.InvoiceID != invoiceID {
@@ -383,7 +427,13 @@ func listPaymentsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
+func listPaymentsHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listPaymentsHandler(w, r)
+}
+
+func (state *runtimeStore) createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	var req paymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -393,13 +443,13 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	invoiceID := strings.TrimSpace(req.InvoiceID)
 	if invoiceID == "" {
@@ -408,7 +458,7 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	invIdx := -1
-	for i, inv := range invoices {
+	for i, inv := range state.invoices {
 		if inv.ID == invoiceID {
 			invIdx = i
 			break
@@ -419,8 +469,22 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Amount <= 0 {
+	if money(req.Amount) <= 0 {
 		writeFieldErrors(w, map[string]string{"amount": "Amount must be positive"})
+		return
+	}
+	ledger := append(append([]Payment{}, state.payments...), state.hiddenLedgerPayments...)
+	exact, possible := receiptRisk(req, ledger)
+	if exact {
+		writeFieldErrors(w, map[string]string{"form": "This invoice already has a receipt with this reference. Check payment history before recording another receipt."})
+		return
+	}
+	if possible && !req.ConfirmDuplicate {
+		writeFieldErrors(w, map[string]string{"form": "A receipt with the same amount, date and method already exists. Check payment history and confirm only if this is a separate receipt.", "duplicate": "Confirm this is a separate receipt"})
+		return
+	}
+	if possible && req.ConfirmDuplicate && strings.TrimSpace(req.Reference) == "" {
+		writeFieldErrors(w, map[string]string{"form": "Enter a distinct receipt reference when confirming a separate receipt."})
 		return
 	}
 
@@ -429,7 +493,7 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		RecordScope: newRecordScope(r),
 		ID:          newID("pay"),
 		InvoiceID:   invoiceID,
-		Amount:      req.Amount,
+		Amount:      money(req.Amount),
 		PaidOn:      normalizeDate(req.PaidOn),
 		Method:      strings.TrimSpace(req.Method),
 		Reference:   strings.TrimSpace(req.Reference),
@@ -438,14 +502,30 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   now,
 	}
 
-	recomputeInvoiceLocked(invIdx)
-	newPayment.RecordScope = invoices[invIdx].RecordScope
-	newPayment.Currency = currencyOf(invoices[invIdx].Currency)
+	state.recomputeInvoiceLocked(invIdx)
+	newPayment.RecordScope = state.invoices[invIdx].RecordScope
+	newPayment.Currency = currencyOf(state.invoices[invIdx].Currency)
 	newPayment.Status = "posted"
-	payments = append(payments, newPayment)
+	if req.RequireApproval {
+		newPayment.Status = "pending_approval"
+	}
+	if possible && req.ConfirmDuplicate {
+		newPayment.Notes += "\nConfirmed as a separate receipt after duplicate warning."
+	}
+	state.payments = append(state.payments, newPayment)
+	if req.RequireApproval {
+		for _, u := range state.users {
+			if !u.Disabled && isManager(u) && canRead(newPayment.RecordScope, u) {
+				if _, err := storeDB(r).Exec("INSERT OR IGNORE INTO notifications VALUES(?,?,?,?,?,?,?,?,?,NULL)", newID("notice"), u.OrgID, u.ID, "receipt", "Receipt awaiting approval", state.invoices[invIdx].InvoiceNumber, "/invoices/"+invoiceID, "receipt:"+newPayment.ID, utcNow()); err != nil {
+					writeError(w, 500, "Could not notify receipt reviewers")
+					return
+				}
+			}
+		}
+	}
 
-	recomputeInvoiceLocked(invIdx)
-	inv := invoices[invIdx]
+	state.recomputeInvoiceLocked(invIdx)
+	inv := state.invoices[invIdx]
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"payment": newPayment,
@@ -453,14 +533,20 @@ func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func deletePaymentHandler(w http.ResponseWriter, r *http.Request) {
+func createPaymentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createPaymentHandler(w, r)
+}
+
+func (state *runtimeStore) deletePaymentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, p := range payments {
+	for i, p := range state.payments {
 		if p.ID == id {
 			idx = i
 			break
@@ -470,22 +556,36 @@ func deletePaymentHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Payment not found")
 		return
 	}
+	if pendingReceipt(state.payments[idx]) || state.payments[idx].Status == "void" {
+		writeError(w, 409, "Use manager review for pending receipts; reviewed receipts must remain in payment history")
+		return
+	}
+	if state.payments[idx].ReviewedAt != "" {
+		writeError(w, 409, "Use the refund workflow for approved receipts; approval history must be retained")
+		return
+	}
 
-	if payments[idx].Status == "refund" || payments[idx].Status == "refund_reversal" || strings.HasPrefix(payments[idx].Method, "Stripe") {
+	if state.payments[idx].Status == "refund" || state.payments[idx].Status == "refund_reversal" || strings.HasPrefix(state.payments[idx].Method, "Stripe") {
 		writeError(w, 409, "Use the refund workflow to reverse this payment")
 		return
 	}
-	invoiceID := payments[idx].InvoiceID
-	for i := range invoices {
-		if invoices[i].ID == invoiceID {
-			recomputeInvoiceLocked(i)
+	invoiceID := state.payments[idx].InvoiceID
+	for i := range state.invoices {
+		if state.invoices[i].ID == invoiceID {
+			state.recomputeInvoiceLocked(i)
 		}
 	}
-	payments = append(payments[:idx], payments[idx+1:]...)
-	for i := range invoices {
-		if invoices[i].ID == invoiceID {
-			recomputeInvoiceLocked(i)
+	state.payments = append(state.payments[:idx], state.payments[idx+1:]...)
+	for i := range state.invoices {
+		if state.invoices[i].ID == invoiceID {
+			state.recomputeInvoiceLocked(i)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deletePaymentHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deletePaymentHandler(w, r)
 }

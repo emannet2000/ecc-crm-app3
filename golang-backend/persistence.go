@@ -40,22 +40,28 @@ type diskStore struct {
 var mutationMu sync.Mutex
 var dataPath string
 
-func snapshot() diskStore {
-	mu.RLock()
-	defer mu.RUnlock()
-	revokedMu.RLock()
-	defer revokedMu.RUnlock()
-	savedUsers := make(map[string]storedUser, len(users))
-	for key, user := range users {
+func (state *runtimeStore) snapshot() diskStore {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	state.revokedMu.RLock()
+	defer state.revokedMu.RUnlock()
+	savedUsers := make(map[string]storedUser, len(state.users))
+	for key, user := range state.users {
 		savedUsers[key] = storedUser{User: user, Password: user.Password, SessionVersion: user.SessionVersion, TOTPSecret: user.TOTPSecret, RecoveryHashes: user.RecoveryHashes, LastTOTPStep: user.LastTOTPStep}
 	}
-	return diskStore{1, savedUsers, contacts, deals, activities, tasks, schools, students, agents, leads, cases, documents, invoices, payments, partners, revokedTokens}
+	return diskStore{1, savedUsers, state.contacts, state.deals, state.activities, state.tasks, state.schools, state.students, state.agents, state.leads, state.cases, state.documents, state.invoices, state.payments, state.partners, state.revokedTokens}
 }
 
-func restoreStore(saved diskStore) {
-	mu.Lock()
-	defer mu.Unlock()
-	users = make(map[string]User, len(saved.Users))
+func snapshot() diskStore {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.snapshot()
+}
+
+func (state *runtimeStore) restoreStore(saved diskStore) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.users = make(map[string]User, len(saved.Users))
 	for key, stored := range saved.Users {
 		user := stored.User
 		user.Password = stored.Password
@@ -63,17 +69,23 @@ func restoreStore(saved diskStore) {
 		user.TOTPSecret = stored.TOTPSecret
 		user.LastTOTPStep = stored.LastTOTPStep
 		user.RecoveryHashes = stored.RecoveryHashes
-		users[key] = user
+		state.users[key] = user
 	}
-	contacts, deals, activities, tasks = saved.Contacts, saved.Deals, saved.Activities, saved.Tasks
-	schools, students, agents, leads = saved.Schools, saved.Students, saved.Agents, saved.Leads
-	cases, documents, invoices, payments, partners = saved.Cases, saved.Documents, saved.Invoices, saved.Payments, saved.Partners
-	revokedMu.Lock()
-	revokedTokens = saved.Revoked
-	if revokedTokens == nil {
-		revokedTokens = map[string]time.Time{}
+	state.contacts, state.deals, state.activities, state.tasks = saved.Contacts, saved.Deals, saved.Activities, saved.Tasks
+	state.schools, state.students, state.agents, state.leads = saved.Schools, saved.Students, saved.Agents, saved.Leads
+	state.cases, state.documents, state.invoices, state.payments, state.partners = saved.Cases, saved.Documents, saved.Invoices, saved.Payments, saved.Partners
+	state.revokedMu.Lock()
+	state.revokedTokens = saved.Revoked
+	if state.revokedTokens == nil {
+		state.revokedTokens = map[string]time.Time{}
 	}
-	revokedMu.Unlock()
+	state.revokedMu.Unlock()
+}
+
+func restoreStore(saved diskStore) {
+	state, release := runtimeForCall(nil)
+	defer release()
+	state.restoreStore(saved)
 }
 
 type bufferedResponse struct {
@@ -101,11 +113,23 @@ func persistMutations(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		mutationMu.Lock()
-		defer mutationMu.Unlock()
 		meta := &requestMeta{}
 		r = r.WithContext(context.WithValue(r.Context(), requestMetaKey, meta))
 		if r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" {
+			saved, err := readIdentityDatabase(database)
+			if err != nil {
+				writeError(w, 503, "Database unavailable")
+				return
+			}
+			r, _ = attachRuntime(r, saved)
+			if strings.HasPrefix(r.URL.Path, "/api/portal/") {
+				full, err := readDatabase(database)
+				if err != nil {
+					writeError(w, 503, "Database unavailable")
+					return
+				}
+				r, _ = attachRuntime(r, full)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -113,14 +137,27 @@ func persistMutations(next http.Handler) http.Handler {
 			writeError(w, 403, "Cross-origin changes are not allowed")
 			return
 		}
-		before := cloneStore()
-		tx, err := database.Begin()
+		tx, err := database.BeginTx(r.Context(), nil)
 		if err != nil {
 			writeError(w, 503, "Database unavailable")
 			return
 		}
 		defer tx.Rollback()
 		r = r.WithContext(context.WithValue(r.Context(), requestTxKey, tx))
+		if err = lockSQLWriter(r); err != nil {
+			writeError(w, 503, "Database busy; retry the change")
+			return
+		}
+		before, err := readIdentityDatabase(tx)
+		if strings.HasPrefix(r.URL.Path, "/api/portal/") || strings.Contains(r.URL.Path, "webhook") || strings.HasPrefix(r.URL.Path, "/api/inbound/") {
+			before, err = readDatabase(tx)
+		}
+		if err != nil {
+			writeError(w, 503, "Could not load committed records")
+			return
+		}
+		r, state := attachRuntime(r, before)
+
 		response := &bufferedResponse{header: make(http.Header)}
 		next.ServeHTTP(response, r)
 		if response.status == 0 {
@@ -132,25 +169,27 @@ func persistMutations(next http.Handler) http.Handler {
 			if actor == "" {
 				actor = requestActor(r)
 			}
-			events := changesBetween(before, snapshot(), actor)
-			err = archiveDeleted(r, before, snapshot(), actor)
+			before = state.before
+			after := state.snapshot()
+			events := changesBetween(before, after, actor)
+			err = archiveDeleted(r, before, after, actor)
 			if err == nil {
-				err = saveDatabaseTx(tx, events)
+				err = saveStoreDeltaTx(tx, before, after, events)
 			}
 			if err == nil {
-				err = queueChangeEvents(r, events)
+				err = state.queueChangeEvents(r, events)
 			}
 			if err == nil {
 				err = tx.Commit()
 			}
 		} else {
-			restoreStore(before)
+			state.restoreStore(before)
 			if meta.PersistFailure {
 				err = tx.Commit()
 			}
 		}
 		if err != nil || !success {
-			restoreStore(before)
+			state.restoreStore(before)
 			for _, cleanup := range meta.Rollback {
 				cleanup()
 			}

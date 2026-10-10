@@ -55,7 +55,7 @@ func featureRequest(h http.Handler, method, path string, data any, cookies []*ht
 		r.AddCookie(c)
 	}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	return w
 }
 func demoCookies(t *testing.T, h http.Handler) []*http.Cookie {
@@ -187,7 +187,7 @@ func TestLockoutAndCSRF(t *testing.T) {
 	r := httptest.NewRequest("POST", "/api/register", strings.NewReader(`{}`))
 	r.Header.Set("Origin", "https://evil.example")
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	assertStatus(t, w, 403)
 }
 func multipartRequest(h http.Handler, path, name, filename string, data []byte, cookies []*http.Cookie, fields map[string]string) *httptest.ResponseRecorder {
@@ -205,7 +205,7 @@ func multipartRequest(h http.Handler, path, name, filename string, data []byte, 
 		r.AddCookie(c)
 	}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	return w
 }
 func TestProtectedFilesVersionsAndExports(t *testing.T) {
@@ -339,7 +339,7 @@ func TestSignedGatewayCallbackIsIdempotent(t *testing.T) {
 		r := httptest.NewRequest("POST", "/api/payments/stripe/webhook", bytes.NewReader(body))
 		r.Header.Set("Stripe-Signature", header)
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
+		serveFixtureRequest(h, w, r)
 		assertStatus(t, w, 200)
 	}
 	if invoices[0].AmountReceived != inv.AmountReceived+100 {
@@ -432,8 +432,12 @@ func TestCaseTemplatesVerificationAndTaskRecurrence(t *testing.T) {
 	tasks[0].DueDate = "2026-10-06"
 	mu.Unlock()
 	before := len(tasks)
+	commitFixtureEdits()
 	generateReminders()
+	reloadFixtureAssertions()
+	commitFixtureEdits()
 	generateReminders()
+	reloadFixtureAssertions()
 	if len(tasks) != before+1 || tasks[len(tasks)-1].DueDate != "2026-10-13" || tasks[len(tasks)-1].Status != "todo" {
 		t.Fatal("recurrence missing or duplicated")
 	}

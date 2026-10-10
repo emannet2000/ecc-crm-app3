@@ -79,11 +79,11 @@ func validateLead(req leadRequest) map[string]string {
 	return fields
 }
 
-func listLeadsHandler(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) listLeadsHandler(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	all := listLeads()
+	all := state.listLeads()
 	filtered := make([]Lead, 0, len(all))
 	for _, l := range all {
 		if q == "" ||
@@ -105,9 +105,15 @@ func listLeadsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getLeadHandler(w http.ResponseWriter, r *http.Request) {
+func listLeadsHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listLeadsHandler(w, r)
+}
+
+func (state *runtimeStore) getLeadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	l, ok := getLeadByID(id)
+	l, ok := state.getLeadByID(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "Lead not found")
 		return
@@ -115,7 +121,13 @@ func getLeadHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"lead": l})
 }
 
-func createLeadHandler(w http.ResponseWriter, r *http.Request) {
+func getLeadHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getLeadHandler(w, r)
+}
+
+func (state *runtimeStore) createLeadHandler(w http.ResponseWriter, r *http.Request) {
 	var req leadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -129,7 +141,7 @@ func createLeadHandler(w http.ResponseWriter, r *http.Request) {
 	email, _ := r.Context().Value(ctxUserEmail).(string)
 	createdBy := "Unknown"
 	if email != "" {
-		if u, ok := findUserByEmail(email); ok {
+		if u, ok := state.findUserByEmail(email); ok {
 			createdBy = u.Name
 		}
 	}
@@ -155,14 +167,20 @@ func createLeadHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:         now,
 	}
 
-	mu.Lock()
-	leads = append(leads, newLead)
-	mu.Unlock()
+	state.mu.Lock()
+	state.leads = append(state.leads, newLead)
+	state.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{"lead": newLead})
 }
 
-func updateLeadHandler(w http.ResponseWriter, r *http.Request) {
+func createLeadHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createLeadHandler(w, r)
+}
+
+func (state *runtimeStore) updateLeadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var req leadRequest
@@ -175,11 +193,11 @@ func updateLeadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, l := range leads {
+	for i, l := range state.leads {
 		if l.ID == id {
 			idx = i
 			break
@@ -190,7 +208,7 @@ func updateLeadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := leads[idx]
+	updated := state.leads[idx]
 	updated.LeadNumber = strings.TrimSpace(req.LeadNumber)
 	updated.Name = strings.TrimSpace(req.Name)
 	updated.Email = strings.TrimSpace(req.Email)
@@ -205,18 +223,24 @@ func updateLeadHandler(w http.ResponseWriter, r *http.Request) {
 	updated.FollowUpDate = strings.TrimSpace(req.FollowUpDate)
 	updated.Notes = req.Notes
 
-	leads[idx] = updated
+	state.leads[idx] = updated
 	writeJSON(w, http.StatusOK, map[string]any{"lead": updated})
 }
 
-func deleteLeadHandler(w http.ResponseWriter, r *http.Request) {
+func updateLeadHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateLeadHandler(w, r)
+}
+
+func (state *runtimeStore) deleteLeadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, l := range leads {
+	for i, l := range state.leads {
 		if l.ID == id {
 			idx = i
 			break
@@ -227,6 +251,12 @@ func deleteLeadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	leads = append(leads[:idx], leads[idx+1:]...)
+	state.leads = append(state.leads[:idx], state.leads[idx+1:]...)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteLeadHandler(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteLeadHandler(w, r)
 }

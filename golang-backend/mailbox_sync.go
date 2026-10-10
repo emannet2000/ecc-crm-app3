@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -145,17 +146,15 @@ func syncMailbox(ctx context.Context) {
 		setSyncStatus("failed", "Mailbox response had no valid next cursor")
 		return
 	}
-	// Only the short database/cache update runs under the legacy mutation lock.
-	mutationMu.Lock()
-	defer mutationMu.Unlock()
-	before := cloneStore()
-	tx, err := database.Begin()
+	runner, r, state, close, err := workerRuntime(ctx, org)
 	if err != nil {
 		setSyncStatus("failed", "Database unavailable")
 		return
 	}
-	defer tx.Rollback()
-	r := httpRequestForWorker(ctx, tx)
+	defer close()
+	tx := runner.(*sql.Tx)
+	before := state.cloneStore()
+
 	for _, message := range page.Value {
 		if len(message.Removed) > 0 {
 			continue
@@ -171,13 +170,13 @@ func syncMailbox(ctx context.Context) {
 		if message.From.EmailAddress.Address == "" {
 			continue
 		}
-		err = attachInbound(r, "email", inboundMessage{ID: "graph:" + message.ID, OrgID: org, From: message.From.EmailAddress.Address, Subject: subject, Body: body, OccurredAt: message.ReceivedDateTime})
+		err = state.attachInbound(r, "email", inboundMessage{ID: "graph:" + message.ID, OrgID: org, From: message.From.EmailAddress.Address, Subject: subject, Body: body, OccurredAt: message.ReceivedDateTime})
 		if err != nil {
 			break
 		}
 	}
 	if err == nil {
-		err = saveDatabaseTx(tx, changesBetween(before, snapshot(), "mailbox:graph"))
+		err = saveStoreDeltaTx(tx, before, state.snapshot(), changesBetween(before, state.snapshot(), "mailbox:graph"))
 	}
 	if err == nil {
 		_, err = tx.Exec("INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", "graph_cursor_"+org, next)
@@ -187,7 +186,7 @@ func syncMailbox(ctx context.Context) {
 	}
 	if err != nil {
 		tx.Rollback()
-		restoreStore(before)
+		state.restoreStore(before)
 		setSyncStatus("failed", "Could not save mailbox messages; the page will be retried")
 		return
 	}

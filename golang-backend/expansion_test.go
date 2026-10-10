@@ -58,7 +58,7 @@ func expansionRequest(t *testing.T, h http.Handler, method, path string, body an
 		r.Header.Set("If-Match", version)
 	}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	return w
 }
 func newBareContact(t *testing.T, h http.Handler) Contact {
@@ -259,7 +259,9 @@ func TestReportingUsesAllRecordsAndCohortDates(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := httptest.NewRecorder()
-	handleReports(r, httptest.NewRequest("GET", "/api/reports", nil))
+	request := httptest.NewRequest("GET", "/api/reports", nil)
+	request = request.WithContext(context.WithValue(request.Context(), requestUserKey, u))
+	handleReports(r, request)
 	var totals reportSummary
 	json.Unmarshal(r.Body.Bytes(), &totals)
 	if totals.StageCounts["Won"] != 501 || totals.CreatedCounts["2026-01-01"] < 501 {
@@ -340,12 +342,16 @@ func TestFollowupRulePreviewActivationAndIdempotentTaskCreation(t *testing.T) {
 	assertStatus(t, expansionRequest(t, h, "PATCH", "/api/follow-up-rules/"+saved.ID, map[string]any{"enabled": true, "previewToken": "stale-preview", "previewExpiresAt": preview.PreviewExpiresAt}, ""), 409)
 	assertStatus(t, expansionRequest(t, h, "PATCH", "/api/follow-up-rules/"+saved.ID, map[string]any{"enabled": true, "previewToken": preview.PreviewToken, "previewExpiresAt": preview.PreviewExpiresAt}, ""), 200)
 	before := len(snapshot().Tasks)
+	commitFixtureEdits()
 	runFollowupRules()
+	reloadFixtureAssertions()
 	after := len(snapshot().Tasks)
 	if after <= before {
 		t.Fatal("enabled rule did not create follow-up tasks")
 	}
+	commitFixtureEdits()
 	runFollowupRules()
+	reloadFixtureAssertions()
 	if len(snapshot().Tasks) != after {
 		t.Fatal("repeated automation created duplicate tasks")
 	}
@@ -421,7 +427,7 @@ func signedEmailRequest(h http.Handler, payload []byte, signature string) *httpt
 	}
 	r.Header.Set("X-ECC-Signature", signature)
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	serveFixtureRequest(h, w, r)
 	return w
 }
 

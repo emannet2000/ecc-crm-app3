@@ -85,17 +85,17 @@ func registerDataRoutes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/contacts/merge", authMiddleware(handleMergeContacts))
 	m.HandleFunc("POST /api/contacts/bulk", authMiddleware(handleBulkContacts))
 }
-func handleInvoicePDF(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+func (state *runtimeStore) handleInvoicePDF(w http.ResponseWriter, r *http.Request) {
+	state.mu.RLock()
 	var inv Invoice
 	ok := false
-	for _, item := range invoices {
+	for _, item := range state.invoices {
 		if item.ID == r.PathValue("id") {
 			inv = item
 			ok = true
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	if !ok {
 		writeError(w, 404, "Invoice not found")
 		return
@@ -109,7 +109,13 @@ func handleInvoicePDF(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="invoice.pdf"`)
 	w.Write(data)
 }
-func handleContactImport(w http.ResponseWriter, r *http.Request) {
+
+func handleInvoicePDF(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleInvoicePDF(w, r)
+}
+func (state *runtimeStore) handleContactImport(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 5<<20)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		writeError(w, 400, "Choose a CSV under 5 MB")
@@ -146,13 +152,13 @@ func handleContactImport(w http.ResponseWriter, r *http.Request) {
 	result := []Contact{}
 	errors := []map[string]any{}
 	seen := map[string]bool{}
-	mu.RLock()
-	for _, c := range contacts {
+	state.mu.RLock()
+	for _, c := range state.contacts {
 		if c.Email != "" {
 			seen[strings.ToLower(c.Email)] = true
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	line := 1
 	for {
 		row, e := reader.Read()
@@ -198,15 +204,21 @@ func handleContactImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !dry {
-		mu.Lock()
-		contacts = append(contacts, result...)
-		mu.Unlock()
+		state.mu.Lock()
+		state.contacts = append(state.contacts, result...)
+		state.mu.Unlock()
 	}
 	preview := result
 	if len(preview) > 20 {
 		preview = preview[:20]
 	}
 	writeJSON(w, 200, map[string]any{"preview": dry, "valid": len(result), "errors": errors, "contacts": preview})
+}
+
+func handleContactImport(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleContactImport(w, r)
 }
 func normalizePhone(s string) string {
 	return strings.NewReplacer(" ", "", "-", "", "(", "", ")", "", ".", "").Replace(s)
@@ -227,17 +239,17 @@ func validPhone(s string) bool {
 	}
 	return true
 }
-func handleDuplicates(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleDuplicates(w http.ResponseWriter, r *http.Request) {
 	groups := map[string][]Contact{}
-	mu.RLock()
-	for _, c := range contacts {
+	state.mu.RLock()
+	for _, c := range state.contacts {
 		key := strings.ToLower(strings.TrimSpace(c.Email))
 		if key == "" {
 			key = "name:" + strings.ToLower(strings.TrimSpace(c.Name)) + ":" + normalizePhone(c.Phone)
 		}
 		groups[key] = append(groups[key], c)
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	out := [][]Contact{}
 	for _, g := range groups {
 		if len(g) > 1 {
@@ -246,7 +258,13 @@ func handleDuplicates(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"groups": out})
 }
-func handleMergeContacts(w http.ResponseWriter, r *http.Request) {
+
+func handleDuplicates(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleDuplicates(w, r)
+}
+func (state *runtimeStore) handleMergeContacts(w http.ResponseWriter, r *http.Request) {
 	var req struct{ KeepID, RemoveID string }
 	if !decodeRequest(w, r, &req) {
 		return
@@ -255,10 +273,10 @@ func handleMergeContacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Choose two different contacts")
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	keep, ok := findContactByID(req.KeepID)
-	remove, other := findContactByID(req.RemoveID)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	keep, ok := state.findContactByID(req.KeepID)
+	remove, other := state.findContactByID(req.RemoveID)
 	if !ok || !other {
 		writeError(w, 404, "Contact not found")
 		return
@@ -279,7 +297,7 @@ func handleMergeContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	keep.Tags = append(keep.Tags, remove.Tags...)
 	out := []Contact{}
-	for _, c := range contacts {
+	for _, c := range state.contacts {
 		if c.ID == keep.ID {
 			c = keep
 		}
@@ -287,39 +305,45 @@ func handleMergeContacts(w http.ResponseWriter, r *http.Request) {
 			out = append(out, c)
 		}
 	}
-	contacts = out
-	for i := range deals {
-		if deals[i].ContactID == remove.ID {
-			deals[i].ContactID = keep.ID
-			deals[i].ContactName = keep.Name
+	state.contacts = out
+	for i := range state.deals {
+		if state.deals[i].ContactID == remove.ID {
+			state.deals[i].ContactID = keep.ID
+			state.deals[i].ContactName = keep.Name
 		}
 	}
-	for i := range tasks {
-		if tasks[i].ContactID == remove.ID {
-			tasks[i].ContactID = keep.ID
-			tasks[i].ContactName = keep.Name
+	for i := range state.tasks {
+		if state.tasks[i].ContactID == remove.ID {
+			state.tasks[i].ContactID = keep.ID
+			state.tasks[i].ContactName = keep.Name
 		}
 	}
-	for i := range activities {
-		if activities[i].ContactID == remove.ID {
-			activities[i].ContactID = keep.ID
+	for i := range state.activities {
+		if state.activities[i].ContactID == remove.ID {
+			state.activities[i].ContactID = keep.ID
 		}
 	}
-	for i := range cases {
-		if cases[i].ClientID == remove.ID {
-			cases[i].ClientID = keep.ID
-			cases[i].ClientName = keep.Name
+	for i := range state.cases {
+		if state.cases[i].ClientID == remove.ID {
+			state.cases[i].ClientID = keep.ID
+			state.cases[i].ClientName = keep.Name
 		}
 	}
-	for i := range invoices {
-		if invoices[i].ClientID == remove.ID {
-			invoices[i].ClientID = keep.ID
-			invoices[i].ClientName = keep.Name
+	for i := range state.invoices {
+		if state.invoices[i].ClientID == remove.ID {
+			state.invoices[i].ClientID = keep.ID
+			state.invoices[i].ClientName = keep.Name
 		}
 	}
 	writeJSON(w, 200, map[string]any{"contact": keep})
 }
-func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
+
+func handleMergeContacts(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleMergeContacts(w, r)
+}
+func (state *runtimeStore) handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs    []string
 		Stage  string
@@ -332,11 +356,11 @@ func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Select 1–500 contacts")
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	selected := map[string]bool{}
 	for _, id := range req.IDs {
-		c, ok := findContactByID(id)
+		c, ok := state.findContactByID(id)
 		if !ok || !canWrite(c.RecordScope, currentUser(r)) {
 			writeError(w, 403, "All selected contacts must be editable")
 			return
@@ -344,13 +368,13 @@ func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		selected[id] = true
 	}
 	if req.Delete {
-		for _, d := range deals {
+		for _, d := range state.deals {
 			if selected[d.ContactID] {
 				writeError(w, 409, "Reassign related deals before deleting contacts")
 				return
 			}
 		}
-		for _, c := range cases {
+		for _, c := range state.cases {
 			if selected[c.ClientID] {
 				writeError(w, 409, "Reassign related cases before deleting contacts")
 				return
@@ -358,7 +382,7 @@ func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	out := []Contact{}
-	for _, c := range contacts {
+	for _, c := range state.contacts {
 		if selected[c.ID] {
 			if req.Delete {
 				continue
@@ -369,8 +393,14 @@ func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, c)
 	}
-	contacts = out
+	state.contacts = out
 	writeJSON(w, 200, map[string]any{"changed": len(req.IDs)})
+}
+
+func handleBulkContacts(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleBulkContacts(w, r)
 }
 func xmlText(s string) string { var b bytes.Buffer; xml.EscapeText(&b, []byte(s)); return b.String() }
 func xlsxExport(header []string, records []map[string]any) ([]byte, error) {

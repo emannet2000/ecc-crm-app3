@@ -34,8 +34,8 @@ func isValidDealStage(stage string) bool {
 }
 
 // findContactByID must be called with mu held.
-func findContactByID(id string) (Contact, bool) {
-	for _, c := range contacts {
+func (state *runtimeStore) findContactByID(id string) (Contact, bool) {
+	for _, c := range state.contacts {
 		if c.ID == id {
 			return c, true
 		}
@@ -43,8 +43,14 @@ func findContactByID(id string) (Contact, bool) {
 	return Contact{}, false
 }
 
+func findContactByID(id string) (Contact, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.findContactByID(id)
+}
+
 // validateDeal must be called with mu held.
-func validateDeal(req dealRequest) map[string]string {
+func (state *runtimeStore) validateDeal(req dealRequest) map[string]string {
 	fields := map[string]string{}
 
 	title := strings.TrimSpace(req.Title)
@@ -69,7 +75,7 @@ func validateDeal(req dealRequest) map[string]string {
 	}
 
 	if contactID != "" {
-		if _, ok := findContactByID(contactID); !ok {
+		if _, ok := state.findContactByID(contactID); !ok {
 			fields["contactId"] = "Contact not found"
 		}
 	}
@@ -77,15 +83,21 @@ func validateDeal(req dealRequest) map[string]string {
 	return fields
 }
 
-func listDeals(w http.ResponseWriter, r *http.Request) {
+func validateDeal(req dealRequest) map[string]string {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.validateDeal(req)
+}
+
+func (state *runtimeStore) listDeals(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	limit, offset := parseLimitOffset(r, 50, 0)
 
-	mu.RLock()
-	defer mu.RUnlock()
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 
-	filtered := make([]Deal, 0, len(deals))
-	for _, d := range deals {
+	filtered := make([]Deal, 0, len(state.deals))
+	for _, d := range state.deals {
 		if r.URL.Query().Get("mine") == "true" && d.OwnerID != currentUser(r).ID {
 			continue
 		}
@@ -106,13 +118,19 @@ func listDeals(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getDeal(w http.ResponseWriter, r *http.Request) {
+func listDeals(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.listDeals(w, r)
+}
+
+func (state *runtimeStore) getDeal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.RLock()
-	defer mu.RUnlock()
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 
-	for _, d := range deals {
+	for _, d := range state.deals {
 		if d.ID == id {
 			writeJSON(w, http.StatusOK, map[string]any{"deal": d})
 			return
@@ -121,17 +139,23 @@ func getDeal(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "Deal not found")
 }
 
-func createDeal(w http.ResponseWriter, r *http.Request) {
+func getDeal(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForReadCall(r)
+	defer release()
+	state.getDeal(w, r)
+}
+
+func (state *runtimeStore) createDeal(w http.ResponseWriter, r *http.Request) {
 	var req dealRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	if fields := validateDeal(req); len(fields) > 0 {
+	if fields := state.validateDeal(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -143,7 +167,7 @@ func createDeal(w http.ResponseWriter, r *http.Request) {
 	contactID := strings.TrimSpace(req.ContactID)
 	contactName := ""
 	if contactID != "" {
-		if c, ok := findContactByID(contactID); ok {
+		if c, ok := state.findContactByID(contactID); ok {
 			contactName = c.Name
 		}
 	}
@@ -164,19 +188,25 @@ func createDeal(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   now,
 	}
 
-	deals = append(deals, newDeal)
+	state.deals = append(state.deals, newDeal)
 
 	writeJSON(w, http.StatusCreated, map[string]any{"deal": newDeal})
 }
 
-func updateDeal(w http.ResponseWriter, r *http.Request) {
+func createDeal(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.createDeal(w, r)
+}
+
+func (state *runtimeStore) updateDeal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, d := range deals {
+	for i, d := range state.deals {
 		if d.ID == id {
 			idx = i
 			break
@@ -193,7 +223,7 @@ func updateDeal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if fields := validateDeal(req); len(fields) > 0 {
+	if fields := state.validateDeal(req); len(fields) > 0 {
 		writeFieldErrors(w, fields)
 		return
 	}
@@ -206,17 +236,26 @@ func updateDeal(w http.ResponseWriter, r *http.Request) {
 	contactID := strings.TrimSpace(req.ContactID)
 	contactName := ""
 	if contactID != "" {
-		if c, ok := findContactByID(contactID); ok {
+		if c, ok := state.findContactByID(contactID); ok {
 			contactName = c.Name
 		}
 	}
 
-	updated := deals[idx]
+	updated := state.deals[idx]
 	updated.Title = strings.TrimSpace(req.Title)
 	updated.ContactID = contactID
 	updated.ContactName = contactName
-	if len(updated.LineItems)>0 {total:=0.0;for _,line:=range updated.LineItems{total+=line.Quantity*line.UnitPrice};if money(req.Value)!=money(total){writeFieldErrors(w,map[string]string{"value":"Change products and prices in Workspace tools to update this amount"});return}}
- updated.Value = req.Value
+	if len(updated.LineItems) > 0 {
+		total := 0.0
+		for _, line := range updated.LineItems {
+			total += line.Quantity * line.UnitPrice
+		}
+		if money(req.Value) != money(total) {
+			writeFieldErrors(w, map[string]string{"value": "Change products and prices in Workspace tools to update this amount"})
+			return
+		}
+	}
+	updated.Value = req.Value
 	if req.Currency != "" {
 		updated.Currency = req.Currency
 	}
@@ -228,19 +267,25 @@ func updateDeal(w http.ResponseWriter, r *http.Request) {
 	updated.Owner = strings.TrimSpace(req.Owner)
 	updated.Notes = req.Notes
 
-	deals[idx] = updated
+	state.deals[idx] = updated
 
 	writeJSON(w, http.StatusOK, map[string]any{"deal": updated})
 }
 
-func updateDealStage(w http.ResponseWriter, r *http.Request) {
+func updateDeal(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateDeal(w, r)
+}
+
+func (state *runtimeStore) updateDealStage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, d := range deals {
+	for i, d := range state.deals {
 		if d.ID == id {
 			idx = i
 			break
@@ -263,22 +308,28 @@ func updateDealStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if deals[idx].Stage != stage {
-		deals[idx].StageHistory = append(deals[idx].StageHistory, StageChange{deals[idx].Stage, stage, currentUser(r).Name, utcNow()})
+	if state.deals[idx].Stage != stage {
+		state.deals[idx].StageHistory = append(state.deals[idx].StageHistory, StageChange{state.deals[idx].Stage, stage, currentUser(r).Name, utcNow()})
 	}
-	deals[idx].Stage = stage
+	state.deals[idx].Stage = stage
 
-	writeJSON(w, http.StatusOK, map[string]any{"deal": deals[idx]})
+	writeJSON(w, http.StatusOK, map[string]any{"deal": state.deals[idx]})
 }
 
-func deleteDeal(w http.ResponseWriter, r *http.Request) {
+func updateDealStage(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.updateDealStage(w, r)
+}
+
+func (state *runtimeStore) deleteDeal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	idx := -1
-	for i, d := range deals {
+	for i, d := range state.deals {
 		if d.ID == id {
 			idx = i
 			break
@@ -289,15 +340,21 @@ func deleteDeal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deals = append(deals[:idx], deals[idx+1:]...)
+	state.deals = append(state.deals[:idx], state.deals[idx+1:]...)
 
-	keptActivities := activities[:0]
-	for _, a := range activities {
+	keptActivities := state.activities[:0]
+	for _, a := range state.activities {
 		if a.DealID != id {
 			keptActivities = append(keptActivities, a)
 		}
 	}
-	activities = keptActivities
+	state.activities = keptActivities
 
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func deleteDeal(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.deleteDeal(w, r)
 }

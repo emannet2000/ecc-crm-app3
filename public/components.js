@@ -195,6 +195,150 @@
       form.onsubmit = event => { event.preventDefault(); load(); }; load();
     }
   }
+  function focusKey(user, org) { return 'ecc-navigation-focus:' + org + ':' + user; }
+  function readFocus(key, fallback = 'adviser') {
+    try { const value = localStorage.getItem(key); return ['adviser','finance','management'].includes(value) ? value : fallback; } catch { return fallback; }
+  }
+  class NavigationFocus extends HTMLElement {
+    connectedCallback() {
+      if (this.firstChild) return;
+      const sidebar = this.closest('.sidebar'), key = focusKey(this.getAttribute('user-id'), this.getAttribute('org-id'));
+      const label = node('label', 'Navigation focus', {class:'navigation-focus'}), select = node('select', null, {'aria-label':'Navigation focus'});
+      for (const [value, text] of [['adviser','Advising'],['finance','Finance'],['management','Management']]) select.append(node('option', text, {value}));
+      const apply = () => {
+        if (sidebar) sidebar.dataset.focus = select.value;
+        document.documentElement.dataset.navFocus = select.value;
+        window.dispatchEvent(new CustomEvent('ecc-navigation-focus', {detail:select.value}));
+      };
+      select.value = readFocus(key, this.getAttribute('default-focus') || 'adviser');
+      select.onchange = () => { try { localStorage.setItem(key, select.value); } catch {} apply(); };
+      label.append(select); this.append(label); apply();
+    }
+  }
+  class MyWork extends HTMLElement {
+    constructor() { super(); this.attachShadow({mode:'open'}); this.generation = 0; }
+    connectedCallback() {
+      style(this.shadowRoot);
+      const root = node('section', null, {class:'tools daily-work'}), result = node('div', null, {'aria-live':'polite'});
+      const toolbar = node('form', null, {class:'toolbar'}), label = node('label','Show work'), scope = node('select', null, {name:'scope', 'aria-label':'Work assignment'});
+      for (const [value,text] of [['mine','Mine and unassigned'],['unassigned','Unassigned'],['all','All accessible work']]) scope.append(node('option',text,{value}));
+      label.append(scope); const refresh = node('button','Refresh work',{type:'submit',class:'secondary'});
+      toolbar.append(label,refresh); root.append(node('h2','My work today'),node('p','Applications, follow-ups and tasks that need your attention. Unassigned work is included so it does not get missed.'),toolbar,result);this.shadowRoot.append(root);
+      let offset=0;
+      this.load = async () => {
+        const generation=++this.generation; refresh.disabled=true;result.replaceChildren(node('p','Loading your work…'));
+        try {
+          const focus=document.documentElement.dataset.navFocus||'adviser';
+          const out=await request('/api/my-work?'+new URLSearchParams({scope:scope.value,focus,offset:String(offset),limit:'25'}));
+          if(!this.isConnected||generation!==this.generation)return;
+          result.replaceChildren(node('p',`${out.today} · ${out.total} work items · full accessible dataset`));
+          const counts=node('div',null,{class:'work-counts'});
+          for(const [key,title] of [['applications','Applications'],['followups','Follow-ups'],['documents','Applications needing documents'],['deadlines','Due within 7 days / overdue'],['tasks','Tasks'],['handoffs','Pending handoffs'],['overdueHandoffs','Overdue handoffs'],['pendingApprovals','Receipts awaiting approval'],['invoices','Invoices requiring attention']]){
+            if(['invoices','pendingApprovals'].includes(key)&&focus!=='finance')continue;
+            const card=node('div',null,{class:'work-count'});card.append(node('strong',out.counts?.[key]||0),node('span',title));counts.append(card);
+          }
+          result.append(counts);
+          if(!out.items?.length){result.append(node('p','No work items in this view. Choose All accessible work to check other assignments.'));return;}
+          for(const item of out.items){
+            const card=node('article',null,{class:'card work-item work-item--'+item.priority});
+            card.append(node('a',item.name,{href:item.route,class:'work-item__title'}),node('p',item.reason),node('p',item.action||'Open the record and choose the next action.'));
+            if(item.deadline)card.append(node('p','Due '+item.deadline));
+            result.append(card);
+          }
+          const pager=node('div',null,{class:'actions'});pager.append(node('span',`${offset+1}–${Math.min(offset+25,out.total)} of ${out.total}`));
+          for(const [text,next,enabled] of [['Previous',offset-25,offset>0],['Next',offset+25,offset+25<out.total]]){if(!enabled)continue;const button=node('button',text,{type:'button',class:'secondary'});button.onclick=()=>{offset=next;this.load()};pager.append(button)}result.append(pager);
+        } catch(error){if(generation===this.generation){result.replaceChildren(node('p',error.message));}}
+        finally{if(generation===this.generation)refresh.disabled=false;}
+      };
+      toolbar.onsubmit=event=>{event.preventDefault();offset=0;this.load()};scope.onchange=()=>{offset=0;this.load()};
+      this.focusChanged=()=>{offset=0;this.load()};window.addEventListener('ecc-navigation-focus',this.focusChanged);window.addEventListener('crm:record-changed',this.focusChanged);this.load();
+    }
+    disconnectedCallback(){this.generation++;window.removeEventListener('ecc-navigation-focus',this.focusChanged);window.removeEventListener('crm:record-changed',this.focusChanged);this.shadowRoot.replaceChildren();}
+  }
+  class StudentJourney extends HTMLElement {
+    static get observedAttributes(){return ['record-id'];}
+    constructor(){super();this.attachShadow({mode:'open'});this.generation=0;}
+    connectedCallback(){this.changed=()=>this.render();window.addEventListener('crm:record-changed',this.changed);this.render();}
+    attributeChangedCallback(){if(this.isConnected)this.render();}
+    disconnectedCallback(){this.generation++;window.removeEventListener('crm:record-changed',this.changed);}
+    async render(){
+      const generation=++this.generation;this.shadowRoot.replaceChildren();style(this.shadowRoot);
+      const root=node('section',null,{class:'tools journey'}),result=node('div',null,{'aria-live':'polite'}),refresh=node('button','Refresh journey',{type:'button',class:'secondary'});
+      refresh.onclick=()=>this.render();root.append(node('h2','Student journey'),refresh,result);this.shadowRoot.append(root);result.append(node('p','Loading applications, documents, messages and payments…'));
+      try{
+        const out=await request('/api/students/'+encodeURIComponent(this.getAttribute('record-id'))+'/journey');if(!this.isConnected||generation!==this.generation)return;
+        result.replaceChildren(node('p',`${out.verified} of ${out.required} required documents verified · ${out.student?.applicationStage||'Application stage not set'} · ${out.student?.intake||'Intake not set'}`));
+        const applications=out.applications||[];
+        if(!applications.length)result.append(node('p','No linked applications yet. Use Application tools & create case to begin.'));
+        for(const app of applications){
+          const card=node('article',null,{class:'card'});card.append(node('a',app.caseNumber,{href:'/cases/'+app.id}),node('p',`Stage: ${app.currentStage} · Owner: ${app.assignedOfficer||'Unassigned'}`),node('p','Next action: '+(app.nextAction||'Choose the next staff action')),node('p','Deadline: '+(app.nextDeadline||'Not set')));
+          const links=node('div',null,{class:'links'});for(const [tab,label] of [['documents','Review documents'],['conversations','Messages'],['workflows','Application tools']])links.append(node('a',label,{href:'/cases/'+app.id+'#record-tools?tab='+tab}));card.append(links);const handoff=node('crm-case-handoff',null,{'record-id':app.id});card.append(node('crm-application-blockers',null,{'record-id':app.id}),handoff);result.append(card);
+        }
+        const sections=[
+          ['Documents',(out.documents||[]).map(d=>({record:d.docName,status:d.status,required:d.required?'Required':'Optional',url:'/cases/'+d.caseId+'#record-tools?tab=documents'})),[['record','Document'],['status','Status'],['required','Requirement']]],
+          ['Invoices',(out.invoices||[]).map(i=>({record:i.invoiceNumber,currency:i.currency||'USD',balance:i.balance,received:i.amountReceived,url:'/invoices/'+i.id})),[['record','Invoice'],['currency','Currency'],['balance','Balance'],['received','Received']]],
+          ['Recorded payments',(out.payments||[]).map(p=>({record:p.reference||p.id,amount:p.amount,currency:p.currency||'USD',status:p.status||'Recorded',date:p.paidOn,url:'/invoices/'+p.invoiceId})),[['record','Reference'],['amount','Amount'],['currency','Currency'],['status','Status'],['date','Paid on']]]
+        ];
+        for(const [title,rows,columns] of sections){const details=node('details',null,{class:'journey-section'});details.append(node('summary',`${title} (${rows.length})`),table(title,rows,columns));result.append(details)}
+        const messages=node('details',null,{class:'journey-section'});messages.append(node('summary',`Application messages (${out.messageTotal||0})`));
+        if(!out.messages?.length)messages.append(node('p','No messages explicitly linked to these applications.'));
+        for(const m of out.messages||[]){const card=node('article',null,{class:'card'});card.append(node('strong',m.subject||m.channel),node('p',`${m.channel} · ${m.direction} · ${m.createdAt}`),node('p',m.body),node('a','Open conversation',{href:'/cases/'+m.caseId+'#record-tools?tab=conversations'}));messages.append(card)}
+        if(out.messageTotal>25)messages.append(node('p','Showing the latest 25 messages. Open an application conversation for more.'));result.append(messages);
+      }catch(error){if(generation===this.generation)result.replaceChildren(node('p',error.message));}
+    }
+  }
+  class FormQuality extends HTMLElement {
+    static get observedAttributes(){return ['entity','record-id','name','studentcode','schoolid','program','email','phone','followupdate','status','studentid','clientid','nextaction','nextdeadline','currentstage'];}
+    constructor(){super();this.attachShadow({mode:'open'});this.generation=0;}
+    connectedCallback(){this.shadowRoot.replaceChildren();style(this.shadowRoot);this.result=node('div',null,{class:'quality-hints',role:'status','aria-live':'polite'});this.shadowRoot.append(this.result);this.schedule();}
+    attributeChangedCallback(){if(this.isConnected)this.schedule();}
+    disconnectedCallback(){clearTimeout(this.timer);this.generation++;}
+    schedule(){
+      clearTimeout(this.timer);const generation=++this.generation;
+      this.timer=setTimeout(async()=>{
+        const payload={entity:this.getAttribute('entity'),id:this.getAttribute('record-id')||''};
+        for(const key of ['name','studentCode','schoolId','program','email','phone','followUpDate','status','studentId','clientId','nextAction','nextDeadline','currentStage'])payload[key]=this.getAttribute(key)||'';
+        try{
+          const out=await request('/api/form-quality',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+          if(!this.isConnected||generation!==this.generation)return;this.result.replaceChildren();
+          if(!out.findings?.length)return;
+          this.result.append(node('strong','Before you save'));const list=node('ul');
+          for(const finding of out.findings){const item=node('li',finding.title+': '+finding.detail);if(finding.route){item.append(document.createTextNode(' '),node('a','Review record',{href:finding.route,target:'_blank',rel:'noopener'}))}list.append(item)}this.result.append(list);
+        }catch(error){if(generation===this.generation&&this.result)this.result.replaceChildren(node('p','Could not check data quality. '+error.message));}
+      },400);
+    }
+  }
+  class IntegrationHealth extends HTMLElement {
+    constructor(){super();this.attachShadow({mode:'open'});this.generation=0;}
+    connectedCallback(){this.render();}
+    disconnectedCallback(){this.generation++;}
+    async render(){
+      const generation=++this.generation;this.shadowRoot.replaceChildren();style(this.shadowRoot);
+      const root=node('section',null,{class:'tools'}),result=node('div',null,{'aria-live':'polite'}),refresh=node('button','Refresh status',{class:'secondary',type:'button'});refresh.onclick=()=>this.render();
+      root.append(node('h2','Integration connections'),node('p','Configured means settings exist. Connected means the most recent connection check succeeded. Checks do not send messages or create payments.'),refresh,result);this.shadowRoot.append(root);
+      try{
+        const out=await request('/api/integrations/status');if(!this.isConnected||generation!==this.generation)return;
+        for(const integration of out.integrations||[]){
+          const card=node('article',null,{class:'card integration-health'}),status=node('strong',integration.state.replaceAll('_',' ')),message=node('p',integration.message),checked=node('p',integration.checkedAt?'Last checked: '+integration.checkedAt:'Connection has not been tested.');
+          card.append(node('h3',integration.name),status,message,checked);
+          if(out.canTest){const button=node('button','Test connection',{type:'button',class:'secondary'});button.disabled=['needs_configuration','disabled'].includes(integration.state);button.onclick=async()=>{button.disabled=true;message.textContent='Testing connection…';try{const check=await request('/api/admin/integrations/'+integration.id+'/test',{method:'POST'});if(!this.isConnected||generation!==this.generation)return;status.textContent=check.state.replaceAll('_',' ');message.textContent=check.message;checked.textContent=check.checkedAt?'Last checked: '+check.checkedAt:'Connection has not been tested.';}catch(error){if(generation===this.generation)message.textContent=error.message;}finally{button.disabled=false}};card.append(button)}
+          result.append(card);
+        }
+      }catch(error){if(generation===this.generation)result.replaceChildren(node('p',error.message));}
+    }
+  }
+  customElements.define('crm-nav-focus',NavigationFocus);
+  customElements.define('crm-my-work',MyWork);
+  customElements.define('crm-student-journey',StudentJourney);
+  customElements.define('crm-form-quality',FormQuality);
+  customElements.define('crm-integration-health',IntegrationHealth);
+  class RecentChanges extends HTMLElement {
+    constructor(){super();this.attachShadow({mode:'open'});this.generation=0;}
+    connectedCallback(){this.load();}
+    disconnectedCallback(){this.generation++;}
+    async load(){const generation=++this.generation;this.shadowRoot.replaceChildren();style(this.shadowRoot);const root=node('section',null,{class:'tools'}),result=node('div',null,{'aria-live':'polite'}),refresh=node('button','Refresh changes',{type:'button',class:'secondary'});refresh.onclick=()=>this.load();root.append(refresh,result);this.shadowRoot.append(root);try{const out=await request('/api/audit?limit=8&offset=0');if(!this.isConnected||generation!==this.generation)return;result.append(table('Recent workspace changes',out.events||[],[['label','Record'],['action','Change'],['actor','By'],['occurredAt','When']]),node('p',`${out.total||0} accessible changes in history`));}catch(error){if(generation===this.generation)result.textContent=error.message;}}
+  }
+  customElements.define('crm-recent-changes',RecentChanges);
   customElements.define('crm-workspace', Workspace);
   customElements.define('crm-record-tools', RecordTools);
   customElements.define('crm-record-photo', RecordPhoto);
@@ -202,7 +346,7 @@
   customElements.define('crm-ai-productivity', AIProductivity);
   const updateTheme = () => {
     const theme=localStorage.getItem('theme') || 'light';
-    for (const element of document.querySelectorAll('crm-workspace,crm-record-tools,crm-insights,crm-ai-productivity,crm-ai-chat,crm-administration')) { if(element.dataset.theme!==theme)element.dataset.theme=theme; }
+    for (const element of document.querySelectorAll('crm-workspace,crm-record-tools,crm-insights,crm-ai-productivity,crm-ai-chat,crm-administration,crm-student-journey,crm-my-work,crm-recent-changes,crm-form-quality,crm-integration-health')) { if(element.dataset.theme!==theme)element.dataset.theme=theme; }
   };
   new MutationObserver(updateTheme).observe(document.getElementById('app'), {childList:true, subtree:true});
   window.addEventListener('crm:theme-changed', updateTheme);

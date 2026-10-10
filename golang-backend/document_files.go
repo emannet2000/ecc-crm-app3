@@ -19,19 +19,25 @@ func registerDocumentRoutes(m *http.ServeMux) {
 	m.HandleFunc("POST /api/documents/{id}/files", authMiddleware(handleFileUpload))
 	m.HandleFunc("GET /api/documents/{id}/files/{version}", authMiddleware(handleFileDownload))
 }
-func visibleDocument(id string) (Document, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, d := range documents {
+func (state *runtimeStore) visibleDocument(id string) (Document, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, d := range state.documents {
 		if d.ID == id {
 			return d, true
 		}
 	}
 	return Document{}, false
 }
+
+func visibleDocument(id string) (Document, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.visibleDocument(id)
+}
 func uploadRoot() string { return filepath.Join(filepath.Dir(dataPath), "uploads") }
-func handleFileVersions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := visibleDocument(r.PathValue("id")); !ok {
+func (state *runtimeStore) handleFileVersions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := state.visibleDocument(r.PathValue("id")); !ok {
 		writeError(w, 404, "Document not found")
 		return
 	}
@@ -41,6 +47,12 @@ func handleFileVersions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"versions": rows})
+}
+
+func handleFileVersions(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleFileVersions(w, r)
 }
 func validatedFile(name string, data []byte) (string, bool) {
 	ext := strings.ToLower(filepath.Ext(name))
@@ -80,8 +92,8 @@ func validatedFile(name string, data []byte) (string, bool) {
 	}
 	return "", false
 }
-func handleFileUpload(w http.ResponseWriter, r *http.Request) {
-	doc, ok := visibleDocument(r.PathValue("id"))
+func (state *runtimeStore) handleFileUpload(w http.ResponseWriter, r *http.Request) {
+	doc, ok := state.visibleDocument(r.PathValue("id"))
 	if !ok {
 		writeError(w, 404, "Document not found")
 		return
@@ -138,23 +150,29 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "Could not save version")
 		return
 	}
-	mu.Lock()
-	for i := range documents {
-		if documents[i].ID == doc.ID {
-			documents[i].LatestVersion = version
-			documents[i].FilePath = fmt.Sprintf("/api/documents/%s/files/%d", doc.ID, version)
-			documents[i].Status = "Received"
-			documents[i].DateReceived = organizationToday(r)
-			documents[i].VerifiedBy = ""
-			documents[i].VerificationDate = ""
-			doc = documents[i]
+	state.mu.Lock()
+	for i := range state.documents {
+		if state.documents[i].ID == doc.ID {
+			state.documents[i].LatestVersion = version
+			state.documents[i].FilePath = fmt.Sprintf("/api/documents/%s/files/%d", doc.ID, version)
+			state.documents[i].Status = "Received"
+			state.documents[i].DateReceived = organizationToday(r)
+			state.documents[i].VerifiedBy = ""
+			state.documents[i].VerificationDate = ""
+			doc = state.documents[i]
 		}
 	}
-	mu.Unlock()
+	state.mu.Unlock()
 	writeJSON(w, 201, map[string]any{"document": doc, "version": version})
 }
-func handleFileDownload(w http.ResponseWriter, r *http.Request) {
-	doc, ok := visibleDocument(r.PathValue("id"))
+
+func handleFileUpload(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleFileUpload(w, r)
+}
+func (state *runtimeStore) handleFileDownload(w http.ResponseWriter, r *http.Request) {
+	doc, ok := state.visibleDocument(r.PathValue("id"))
 	if !ok {
 		writeError(w, 404, "Document not found")
 		return
@@ -186,4 +204,10 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, no-store")
 	io.Copy(w, f)
+}
+
+func handleFileDownload(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleFileDownload(w, r)
 }

@@ -120,15 +120,21 @@ func ipAllowed(r *http.Request, user User) bool {
 	}
 	return false
 }
-func findUserByID(id string) (User, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	for _, user := range users {
+func (state *runtimeStore) findUserByID(id string) (User, bool) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, user := range state.users {
 		if user.ID == id {
 			return user, true
 		}
 	}
 	return User{}, false
+}
+
+func findUserByID(id string) (User, bool) {
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.findUserByID(id)
 }
 func authorizeWorkspaceRequest(next http.HandlerFunc, w http.ResponseWriter, r *http.Request, user User, sessionID string) {
 	if user.Disabled || !ipAllowed(r, user) {
@@ -191,8 +197,7 @@ func cookieIdentity(r *http.Request) (User, string, error) {
 	if err != nil || !when.After(time.Now()) {
 		return User{}, "", fmt.Errorf("session expired")
 	}
-	user, exists := findUserByID(userID)
-	if independentRead(r) { user,exists=committedUser(r,"id",userID) }
+	user, exists := committedUser(r, "id", userID)
 	if !exists || user.Disabled || user.SessionVersion != version {
 		return User{}, "", fmt.Errorf("session revoked")
 	}
@@ -202,7 +207,7 @@ func cookieIdentity(r *http.Request) (User, string, error) {
 	}
 	return user, id, nil
 }
-func handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie("ecc_refresh")
 	if err != nil {
 		clearSessionCookies(w, r)
@@ -214,7 +219,7 @@ func handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
 	var persistent bool
 	err = storeDB(r).QueryRow("SELECT id,user_id,refresh_expires_at,version,persistent FROM sessions WHERE refresh_hash=? AND revoked_at IS NULL", hashSecret(cookie.Value)).Scan(&id, &userID, &expiry, &version, &persistent)
 	when, parseErr := time.Parse(time.RFC3339, expiry)
-	user, exists := findUserByID(userID)
+	user, exists := state.findUserByID(userID)
 	if err != nil || parseErr != nil || !when.After(time.Now()) || !exists || user.Disabled || user.SessionVersion != version || !ipAllowed(r, user) {
 		clearSessionCookies(w, r)
 		writeError(w, 401, "Session expired. Please sign in again")
@@ -228,6 +233,12 @@ func handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	setSessionCookies(w, r, access, refresh, persistent)
 	writeJSON(w, 200, authResponse{Token: "cookie-session", User: user})
+}
+
+func handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSessionRefresh(w, r)
 }
 func handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie("ecc_session"); err == nil {
@@ -280,7 +291,7 @@ func failedLogin(r *http.Request, user User, email string) {
 		meta.PersistFailure = true
 	}
 }
-func handleSecureLogin(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleSecureLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Email, Password, OTP string
 		Remember             bool
@@ -294,7 +305,7 @@ func handleSecureLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 429, "Too many failed attempts. Try again in 15 minutes")
 		return
 	}
-	user, exists := findUserByEmail(email)
+	user, exists := state.findUserByEmail(email)
 	if !exists || user.Disabled || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)) != nil {
 		failedLogin(r, user, email)
 		writeError(w, 401, "Invalid email or password")
@@ -313,9 +324,9 @@ func handleSecureLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "Enter a valid verification or recovery code")
 		return
 	}
-	mu.Lock()
-	users[email] = user
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[email] = user
+	state.mu.Unlock()
 	if err := mintSession(w, r, user, req.Remember); err != nil {
 		writeError(w, 500, "Could not create session")
 		return
@@ -328,7 +339,13 @@ func handleSecureLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, authResponse{Token: "cookie-session", User: user})
 }
-func handleSecureRegister(w http.ResponseWriter, r *http.Request) {
+
+func handleSecureLogin(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSecureLogin(w, r)
+}
+func (state *runtimeStore) handleSecureRegister(w http.ResponseWriter, r *http.Request) {
 	if os.Getenv("ALLOW_SIGNUP") == "false" {
 		writeError(w, 403, "Registration is disabled. Ask an administrator for an invitation")
 		return
@@ -350,7 +367,7 @@ func handleSecureRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, message)
 		return
 	}
-	if _, exists := findUserByEmail(email); exists {
+	if _, exists := state.findUserByEmail(email); exists {
 		writeError(w, 409, "An account with that email already exists")
 		return
 	}
@@ -369,9 +386,9 @@ func handleSecureRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := User{ID: newID("u"), Name: name, Email: email, Password: string(hash), OrgID: orgID, TeamID: teamID, Role: "admin"}
-	mu.Lock()
-	users[email] = user
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[email] = user
+	state.mu.Unlock()
 	if err = mintSession(w, r, user, req.Remember); err != nil {
 		writeError(w, 500, "Could not create session")
 		return
@@ -382,6 +399,12 @@ func handleSecureRegister(w http.ResponseWriter, r *http.Request) {
 		meta.OrgID = user.OrgID
 	}
 	writeJSON(w, 201, authResponse{Token: "cookie-session", User: user})
+}
+
+func handleSecureRegister(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleSecureRegister(w, r)
 }
 func encryptSecret(plain string) (string, error) {
 	key := sha256.Sum256(jwtSecret)
@@ -457,7 +480,7 @@ func verifySecondFactor(user *User, code string) bool {
 	}
 	return false
 }
-func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleTwoFactor(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	var req struct{ Action, Password, Code string }
 	if !decodeRequest(w, r, &req) {
@@ -482,9 +505,9 @@ func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		user.TOTPSecret = encrypted
-		mu.Lock()
-		users[strings.ToLower(user.Email)] = user
-		mu.Unlock()
+		state.mu.Lock()
+		state.users[strings.ToLower(user.Email)] = user
+		state.mu.Unlock()
 		uri := "otpauth://totp/" + url.PathEscape("ECC CRM:"+user.Email) + "?secret=" + secret + "&issuer=ECC%20CRM&algorithm=SHA1&digits=6&period=30"
 		writeJSON(w, 200, map[string]any{"secret": secret, "uri": uri})
 		return
@@ -508,9 +531,9 @@ func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
 		user.LastTOTPStep = time.Now().Unix() / 30
 		user.TwoFactorEnabled = true
 		user.SessionVersion++
-		mu.Lock()
-		users[strings.ToLower(user.Email)] = user
-		mu.Unlock()
+		state.mu.Lock()
+		state.users[strings.ToLower(user.Email)] = user
+		state.mu.Unlock()
 		if err = mintSession(w, r, user, true); err != nil {
 			writeError(w, 500, "Could not refresh session")
 			return
@@ -527,9 +550,9 @@ func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
 		user.TOTPSecret = ""
 		user.RecoveryHashes = nil
 		user.SessionVersion++
-		mu.Lock()
-		users[strings.ToLower(user.Email)] = user
-		mu.Unlock()
+		state.mu.Lock()
+		state.users[strings.ToLower(user.Email)] = user
+		state.mu.Unlock()
 		if err := mintSession(w, r, user, true); err != nil {
 			writeError(w, 500, "Could not refresh session")
 			return
@@ -541,13 +564,19 @@ func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Unknown security action")
 	}
 }
-func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
+
+func handleTwoFactor(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleTwoFactor(w, r)
+}
+func (state *runtimeStore) handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Email string }
 	if !decodeRequest(w, r, &req) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
-	if user, exists := findUserByEmail(email); exists && !user.Disabled {
+	if user, exists := state.findUserByEmail(email); exists && !user.Disabled {
 		secret := randomSecret()
 		storeDB(r).Exec("UPDATE auth_tokens SET used_at=? WHERE user_id=? AND purpose='reset' AND used_at IS NULL", utcNow(), user.ID)
 		_, err := storeDB(r).Exec("INSERT INTO auth_tokens(hash,user_id,purpose,expires_at) VALUES(?,?,'reset',?)", hashSecret(secret), user.ID, time.Now().Add(30*time.Minute).UTC().Format(time.RFC3339))
@@ -563,17 +592,29 @@ func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]string{"message": "If an active account exists, a recovery email will be sent. Contact your administrator if it does not arrive."})
 }
-func consumeAuthToken(r *http.Request, secret, purpose string) (User, error) {
+
+func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleForgotPassword(w, r)
+}
+func (state *runtimeStore) consumeAuthToken(r *http.Request, secret, purpose string) (User, error) {
 	var userID, expires string
 	err := storeDB(r).QueryRow("SELECT user_id,expires_at FROM auth_tokens WHERE hash=? AND purpose=? AND used_at IS NULL", hashSecret(secret), purpose).Scan(&userID, &expires)
 	when, parseErr := time.Parse(time.RFC3339, expires)
-	user, exists := findUserByID(userID)
+	user, exists := state.findUserByID(userID)
 	if err != nil || parseErr != nil || !when.After(time.Now()) || !exists {
 		return User{}, fmt.Errorf("This link is invalid or expired")
 	}
 	return user, nil
 }
-func handleResetPassword(w http.ResponseWriter, r *http.Request) {
+
+func consumeAuthToken(r *http.Request, secret, purpose string) (User, error) {
+	state, release := runtimeForCall(r)
+	defer release()
+	return state.consumeAuthToken(r, secret, purpose)
+}
+func (state *runtimeStore) handleResetPassword(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Token, Password string }
 	if !decodeRequest(w, r, &req) {
 		return
@@ -582,7 +623,7 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, message)
 		return
 	}
-	user, err := consumeAuthToken(r, req.Token, "reset")
+	user, err := state.consumeAuthToken(r, req.Token, "reset")
 	if err != nil || user.Disabled {
 		writeError(w, 400, "This link is invalid or expired")
 		return
@@ -594,13 +635,19 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	user.Password = string(hash)
 	user.SessionVersion++
-	mu.Lock()
-	users[strings.ToLower(user.Email)] = user
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[strings.ToLower(user.Email)] = user
+	state.mu.Unlock()
 	storeDB(r).Exec("UPDATE auth_tokens SET used_at=? WHERE user_id=? AND purpose='reset' AND used_at IS NULL", utcNow(), user.ID)
 	securityEvent(r, user, "password_reset.completed")
 	clearSessionCookies(w, r)
 	writeJSON(w, 200, map[string]string{"message": "Password changed. Sign in with your new password."})
+}
+
+func handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleResetPassword(w, r)
 }
 func initializePersistentSecret() {
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
@@ -623,8 +670,30 @@ func initializePersistentSecret() {
 	if err != nil && !os.IsNotExist(err) {
 		panic(err)
 	}
-	jwtSecret = []byte(randomSecret())
-	if err = os.WriteFile(path, jwtSecret, 0600); err != nil {
+	secret := []byte(randomSecret())
+	file, err := os.CreateTemp(root, ".auth-secret-*")
+	if err != nil {
 		panic(err)
 	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if _, err = file.Write(secret); err != nil {
+		file.Close()
+		panic(err)
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		panic(err)
+	}
+	if err = file.Close(); err != nil {
+		panic(err)
+	}
+	if err = os.Link(tempPath, path); err != nil && !os.IsExist(err) {
+		panic(err)
+	}
+	saved, err = os.ReadFile(path)
+	if err != nil || len(saved) < 32 {
+		panic("Persistent auth secret is unavailable or invalid")
+	}
+	jwtSecret = saved
 }

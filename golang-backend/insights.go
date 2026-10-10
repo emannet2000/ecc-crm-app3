@@ -12,30 +12,70 @@ import (
 // A transaction gives each report one committed view, without frontend page limits.
 func sqlWorkspace(r *http.Request) (diskStore, error) {
 	var s diskStore
-	for _, e := range entityTables {
-		clause, args := scopeSQL(r, "data")
-		rows, err := storeDB(r).Query("SELECT id,data FROM "+e+" WHERE "+clause, args...)
-		if err != nil {
-			return s, err
-		}
-		for rows.Next() {
-			var id, data string
-			if err = rows.Scan(&id, &data); err != nil {
-				rows.Close()
-				return s, err
-			}
-			if err = replaceSavedRecord(&s, e, id, data); err != nil {
-				rows.Close()
-				return s, err
-			}
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return s, err
-		}
+	var err error
+	if s.Contacts, err = readScopedRows[Contact](r, "contacts"); err != nil {
+		return s, err
 	}
+	if s.Deals, err = readScopedRows[Deal](r, "deals"); err != nil {
+		return s, err
+	}
+	if s.Activities, err = readScopedRows[Activity](r, "activities"); err != nil {
+		return s, err
+	}
+	if s.Tasks, err = readScopedRows[Task](r, "tasks"); err != nil {
+		return s, err
+	}
+	if s.Schools, err = readScopedRows[School](r, "schools"); err != nil {
+		return s, err
+	}
+	if s.Students, err = readScopedRows[Student](r, "students"); err != nil {
+		return s, err
+	}
+	if s.Agents, err = readScopedRows[Agent](r, "agents"); err != nil {
+		return s, err
+	}
+	if s.Leads, err = readScopedRows[Lead](r, "leads"); err != nil {
+		return s, err
+	}
+	if s.Cases, err = readScopedRows[Case](r, "cases"); err != nil {
+		return s, err
+	}
+	if s.Documents, err = readScopedRows[Document](r, "documents"); err != nil {
+		return s, err
+	}
+	if s.Invoices, err = readScopedRows[Invoice](r, "invoices"); err != nil {
+		return s, err
+	}
+	if s.Payments, err = readScopedRows[Payment](r, "payments"); err != nil {
+		return s, err
+	}
+	if s.Partners, err = readScopedRows[Partner](r, "partners"); err != nil {
+		return s, err
+	}
+
 	return projectedStore(s, currentUser(r)), nil
+}
+
+func readScopedRows[T any](r *http.Request, entity string) ([]T, error) {
+	clause, args := scopeSQL(r, "data")
+	rows, err := storeDB(r).Query("SELECT data FROM "+entity+" WHERE "+clause+" ORDER BY sort_order,id", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []T{}
+	for rows.Next() {
+		var payload string
+		var record T
+		if err = rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal([]byte(payload), &record); err != nil {
+			return nil, err
+		}
+		out = append(out, record)
+	}
+	return out, rows.Err()
 }
 
 type conversionMetric struct {
@@ -245,39 +285,18 @@ func handleInsights(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(next, func(i, j int) bool { return fmtString(next[i]["deadline"]) < fmtString(next[j]["deadline"]) })
 	writeJSON(w, 200, map[string]any{"sources": sources, "enrollment": enrollment, "agents": agents, "stages": duration, "nextActions": next, "from": from, "to": to, "cohort": "Lead and student creation dates; case creation dates for stage duration. Stage time is measured only from recorded transitions; current visits include elapsed time.", "totals": map[string]int{"contacts": len(s.Contacts), "deals": len(s.Deals), "students": len(s.Students), "cases": len(s.Cases)}})
 }
+
+// Stage history is append-only. Compare with the latest recorded transition,
+// rather than rescanning all cases after their new payloads have been saved.
 func trackCaseStages(tx *sql.Tx, s diskStore) error {
-	rows, err := tx.Query("SELECT id,data FROM cases")
-	if err != nil {
-		return err
-	}
-	old := map[string]string{}
-	for rows.Next() {
-		var id, payload string
-		if err = rows.Scan(&id, &payload); err != nil {
-			rows.Close()
-			return err
-		}
-		var c Case
-		if err = json.Unmarshal([]byte(payload), &c); err != nil {
-			rows.Close()
-			return err
-		}
-		old[id] = c.CurrentStage
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
 	for _, c := range s.Cases {
-		var count int
-		if old[c.ID] == c.CurrentStage {
-			if err = tx.QueryRow("SELECT count(*) FROM case_stage_events WHERE case_id=?", c.ID).Scan(&count); err != nil {
-				return err
-			}
-			if count > 0 {
-				continue
-			}
+		var previous string
+		err := tx.QueryRow("SELECT stage FROM case_stage_events WHERE org_id=? AND case_id=? ORDER BY rowid DESC LIMIT 1", c.OrgID, c.ID).Scan(&previous)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if err == nil && previous == c.CurrentStage {
+			continue
 		}
 		if _, err = tx.Exec("INSERT INTO case_stage_events VALUES(?,?,?,?,?)", newID("stage"), c.OrgID, c.ID, c.CurrentStage, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err

@@ -31,7 +31,11 @@ type reportSummary struct {
 }
 
 func handleReports(w http.ResponseWriter, r *http.Request) {
-	saved := snapshot()
+	r, saved, close, ok := dailySnapshot(w, r)
+	if !ok {
+		return
+	}
+	defer close()
 	contacts, students, leads, cases, tasks, deals, invoices := saved.Contacts, saved.Students, saved.Leads, saved.Cases, saved.Tasks, saved.Deals, saved.Invoices
 	pipeline, won, balance := map[string]float64{}, map[string]float64{}, map[string]float64{}
 	report := reportSummary{StageCounts: map[string]int{}, StageValues: map[string]float64{}, CreatedCounts: map[string]int{}, Contacts: len(contacts), Students: len(students), Leads: len(leads)}

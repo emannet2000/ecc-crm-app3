@@ -31,12 +31,13 @@ const requestUserKey contextKey = "user"
 const requestMetaKey contextKey = "requestMeta"
 
 type requestMeta struct {
-	SAMLRedirect   string
-	Actor          string
-	OrgID          string
-	PersistFailure bool
-	Rollback       []func()
-	AfterCommit    []func()
+	OwnershipTransfers map[string]bool
+	SAMLRedirect       string
+	Actor              string
+	OrgID              string
+	PersistFailure     bool
+	Rollback           []func()
+	AfterCommit        []func()
 }
 
 func storeDB(r *http.Request) DBRunner {
@@ -182,11 +183,14 @@ func mergeStores(original, before, after diskStore, user User) diskStore {
 	after.Partners = mergeRecords(original.Partners, before.Partners, after.Partners, user)
 	return after
 }
+func (state *runtimeStore) cloneStore() diskStore {
+	return cloneStoreValue(reflect.ValueOf(state.snapshot())).Interface().(diskStore)
+}
+
 func cloneStore() diskStore {
-	payload, _ := json.Marshal(snapshot())
-	var saved diskStore
-	json.Unmarshal(payload, &saved)
-	return saved
+	state, release := runtimeForReadCall(nil)
+	defer release()
+	return state.cloneStore()
 }
 func recordOrg(payload string) string {
 	var scope RecordScope
@@ -201,10 +205,47 @@ func recordOrg(payload string) string {
 // receive a private projection; only that projection's changes can be merged.
 func scopedHandler(next http.HandlerFunc, w http.ResponseWriter, r *http.Request, user User) {
 	if independentRead(r) {
+		if entity, id, ok := repositoryRoute(r); ok {
+			handleRepositoryRead(w, r, entity, id)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/photo") || strings.HasSuffix(r.URL.Path, "/qr") {
+			record, err := sqlRecord(r, r.PathValue("entity"), r.PathValue("id"))
+			if err != nil {
+				writeError(w, 404, "Record not found")
+				return
+			}
+			var saved diskStore
+			if err = replaceSavedRecord(&saved, r.PathValue("entity"), r.PathValue("id"), mustJSON(record)); err != nil {
+				writeError(w, 500, "Could not load record")
+				return
+			}
+			r, _ = attachRuntime(r, saved)
+		}
+
 		next(w, r)
 		return
 	}
-	original := cloneStore()
+	nested, _ := r.Context().Value(contextKey("scopedRequest")).(bool)
+	r = r.WithContext(context.WithValue(r.Context(), contextKey("scopedRequest"), true))
+	if !nested && targetedContactWrite(next, w, r, user) {
+		return
+	}
+	state, release := runtimeForCall(r)
+	defer release()
+	identity := state.snapshot()
+	orgUser := user
+	orgUser.Role = "admin"
+	orgRequest := r.WithContext(context.WithValue(r.Context(), requestUserKey, orgUser))
+	original, err := sqlWorkspace(orgRequest)
+	if err != nil {
+		writeError(w, 503, "Could not load committed workspace records")
+		return
+	}
+	original.Users, original.Revoked = identity.Users, identity.Revoked
+	state.restoreStore(original)
+	state.before = state.cloneStore()
+	original = state.cloneStore()
 	projected := projectedStore(original, user)
 	if r.Method == "GET" && r.URL.Query().Get("filterStatus") != "" {
 		filterProjectedStatus(&projected, r)
@@ -247,30 +288,31 @@ func scopedHandler(next http.HandlerFunc, w http.ResponseWriter, r *http.Request
 	if !checkRecordVersion(w, r, projected) {
 		return
 	}
-	restoreStore(projected)
-	mu.Lock()
+	state.restoreStore(projected)
+	state.mu.Lock()
 	visiblePayments := map[string]bool{}
 	for _, p := range projected.Payments {
 		visiblePayments[p.ID] = true
 	}
-	hiddenLedgerPayments = nil
+	state.hiddenLedgerPayments = nil
 	for _, p := range original.Payments {
 		if !visiblePayments[p.ID] && p.OrgID == user.OrgID {
-			hiddenLedgerPayments = append(hiddenLedgerPayments, p)
+			state.hiddenLedgerPayments = append(state.hiddenLedgerPayments, p)
 		}
 	}
-	mu.Unlock()
-	defer func() { mu.Lock(); hiddenLedgerPayments = nil; mu.Unlock() }()
+	state.mu.Unlock()
+	defer func() { state.mu.Lock(); state.hiddenLedgerPayments = nil; state.mu.Unlock() }()
 	response := &bufferedResponse{header: make(http.Header)}
 	next(response, r)
 	if response.status == 0 {
 		response.status = 200
 	}
 
-	after := snapshot()
+	after := state.snapshot()
 	if r.Method != "GET" && r.Method != "HEAD" && response.status >= 200 && response.status < 300 {
 		changes := changesBetween(projected, after, user.Email)
 		beforeRecords := recordsOf(projected)
+		afterRecords := recordsOf(after)
 		for _, change := range changes {
 			if change.Entity == "users" {
 				continue
@@ -278,8 +320,8 @@ func scopedHandler(next http.HandlerFunc, w http.ResponseWriter, r *http.Request
 			if payload, exists := beforeRecords[change.Entity][change.RecordID]; exists {
 				var scope RecordScope
 				json.Unmarshal([]byte(payload), &scope)
-				if !canWrite(scope, user) && !computedOnly(change.Entity, payload, recordsOf(after)[change.Entity][change.RecordID]) {
-					restoreStore(original)
+				if !canWrite(scope, user) && !(metadata(r) != nil && metadata(r).OwnershipTransfers[change.Entity+":"+change.RecordID]) && !computedOnly(change.Entity, payload, afterRecords[change.Entity][change.RecordID]) {
+					state.restoreStore(original)
 					writeError(w, 403, "A related record is outside your edit permissions")
 					return
 				}
@@ -287,17 +329,17 @@ func scopedHandler(next http.HandlerFunc, w http.ResponseWriter, r *http.Request
 		}
 		merged := mergeStores(original, projected, after, user)
 		if danglingDeletedRelations(original, merged) {
-			restoreStore(original)
+			state.restoreStore(original)
 			writeError(w, 409, "Reassign related records before deleting or merging this record")
 			return
 		}
-		restoreStore(merged)
-		mu.Lock()
-		hiddenLedgerPayments = nil
-		mu.Unlock()
-		applyComputedData()
+		state.restoreStore(merged)
+		state.mu.Lock()
+		state.hiddenLedgerPayments = nil
+		state.mu.Unlock()
+		state.applyComputedData()
 	} else {
-		restoreStore(original)
+		state.restoreStore(original)
 	}
 	for key, values := range response.header {
 		w.Header()[key] = values

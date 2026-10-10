@@ -76,7 +76,7 @@ func queryObjects(r *http.Request, query string, args ...any) ([]map[string]any,
 	}
 	return out, rows.Err()
 }
-func handleControlCenter(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleControlCenter(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	result := map[string]any{"user": user, "role": user.Role, "features": integrationStatusFor(r)}
 	queries := map[string]struct {
@@ -114,7 +114,7 @@ func handleControlCenter(w http.ResponseWriter, r *http.Request) {
 			safe := []map[string]any{}
 			for _, record := range records {
 				id, _ := record["recordId"].(string)
-				if id == "" || visibleRecordID(snapshot(), id) || record["category"] == "saved_view" {
+				if id == "" || visibleRecordID(state.snapshot(), id) || record["category"] == "saved_view" {
 					safe = append(safe, record)
 				}
 			}
@@ -123,8 +123,8 @@ func handleControlCenter(w http.ResponseWriter, r *http.Request) {
 		result[key] = records
 	}
 	directory := []User{}
-	mu.RLock()
-	for _, candidate := range users {
+	state.mu.RLock()
+	for _, candidate := range state.users {
 		if candidate.OrgID == user.OrgID {
 			if isAdmin(user) {
 				directory = append(directory, candidate)
@@ -133,9 +133,9 @@ func handleControlCenter(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	result["users"] = directory
-	records := recordsOf(snapshot())
+	records := recordsOf(state.snapshot())
 	options := map[string][]map[string]string{}
 	for entity, items := range records {
 		if entity == "users" {
@@ -149,6 +149,12 @@ func handleControlCenter(w http.ResponseWriter, r *http.Request) {
 	result["records"] = options
 	result["currentSessionId"] = r.Context().Value(ctxTokenID)
 	writeJSON(w, 200, result)
+}
+
+func handleControlCenter(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleControlCenter(w, r)
 }
 func handleCreateTeam(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
@@ -178,7 +184,7 @@ func teamInOrganization(r *http.Request, id string) bool {
 	storeDB(r).QueryRow("SELECT count(*) FROM teams WHERE id=? AND org_id=?", id, currentUser(r).OrgID).Scan(&count)
 	return count == 1
 }
-func handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
@@ -198,7 +204,7 @@ func handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Enter a name, valid email, role, and team")
 		return
 	}
-	if _, exists := findUserByEmail(req.Email); exists {
+	if _, exists := state.findUserByEmail(req.Email); exists {
 		writeError(w, 409, "An account with that email already exists")
 		return
 	}
@@ -215,9 +221,9 @@ func handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := User{ID: newID("u"), Name: req.Name, Email: req.Email, Password: string(hash), OrgID: currentUser(r).OrgID, TeamID: req.TeamID, Role: req.Role, Disabled: invited}
-	mu.Lock()
-	users[user.Email] = user
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[user.Email] = user
+	state.mu.Unlock()
 	result := map[string]any{"user": user}
 	if invited {
 		secret := randomSecret()
@@ -236,8 +242,14 @@ func handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 	securityEvent(r, user, "admin.user_created")
 	writeJSON(w, 201, result)
 }
-func handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
-	target, ok := adminTarget(w, r)
+
+func handleCreateWorkspaceUser(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleCreateWorkspaceUser(w, r)
+}
+func (state *runtimeStore) handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
+	target, ok := state.adminTarget(w, r)
 	if !ok {
 		return
 	}
@@ -277,13 +289,13 @@ func handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 	removingAdmin := (req.Role != "" && req.Role != "admin") || (req.Disabled != nil && *req.Disabled)
 	if target.Role == "admin" && !target.Disabled && removingAdmin {
 		count := 0
-		mu.RLock()
-		for _, user := range users {
+		state.mu.RLock()
+		for _, user := range state.users {
 			if user.OrgID == target.OrgID && user.Role == "admin" && !user.Disabled {
 				count++
 			}
 		}
-		mu.RUnlock()
+		state.mu.RUnlock()
 		if count <= 1 {
 			writeError(w, 409, "Keep at least one active administrator")
 			return
@@ -309,7 +321,7 @@ func handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 		target.TOTPSecret = ""
 		target.RecoveryHashes = nil
 	}
-	if err := invalidateUserSessions(r, &target); err != nil {
+	if err := state.invalidateUserSessions(r, &target); err != nil {
 		writeError(w, 500, "Could not revoke previous sessions")
 		return
 	}
@@ -319,7 +331,13 @@ func handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"user": target})
 }
-func handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
+
+func handleManageWorkspaceUser(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleManageWorkspaceUser(w, r)
+}
+func (state *runtimeStore) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Token, Password, Name string }
 	if !decodeRequest(w, r, &req) {
 		return
@@ -328,7 +346,7 @@ func handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, message)
 		return
 	}
-	user, err := consumeAuthToken(r, req.Token, "invite")
+	user, err := state.consumeAuthToken(r, req.Token, "invite")
 	if err != nil {
 		writeError(w, 400, "Invitation is invalid or expired")
 		return
@@ -344,12 +362,18 @@ func handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Name) != "" {
 		user.Name = strings.TrimSpace(req.Name)
 	}
-	mu.Lock()
-	users[strings.ToLower(user.Email)] = user
-	mu.Unlock()
+	state.mu.Lock()
+	state.users[strings.ToLower(user.Email)] = user
+	state.mu.Unlock()
 	storeDB(r).Exec("UPDATE auth_tokens SET used_at=? WHERE hash=?", utcNow(), hashSecret(req.Token))
 	securityEvent(r, user, "invite.accepted")
 	writeJSON(w, 200, map[string]string{"message": "Invitation accepted. Sign in to your workspace."})
+}
+
+func handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleAcceptInvite(w, r)
 }
 func handleOrganizationSettings(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
@@ -385,10 +409,10 @@ func handleOrganizationSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, statusResponse{"ok"})
 }
-func handleRecordAccess(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleRecordAccess(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	entity, id := r.PathValue("entity"), r.PathValue("id")
-	items := recordsOf(snapshot())[entity]
+	items := recordsOf(state.snapshot())[entity]
 	payload, exists := items[id]
 	if !exists {
 		writeError(w, 404, "Record not found")
@@ -411,7 +435,7 @@ func handleRecordAccess(w http.ResponseWriter, r *http.Request) {
 	if req.OwnerID == "" {
 		req.OwnerID = scope.OwnerID
 	}
-	owner, exists := findUserByID(req.OwnerID)
+	owner, exists := state.findUserByID(req.OwnerID)
 	if !exists || owner.OrgID != user.OrgID || !teamInOrganization(r, req.TeamID) {
 		writeError(w, 400, "Owner and team must belong to your workspace")
 		return
@@ -420,12 +444,18 @@ func handleRecordAccess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 403, "Only managers can reassign ownership")
 		return
 	}
-	setRecordScope(entity, id, RecordScope{user.OrgID, req.OwnerID, req.TeamID, req.Visibility})
+	state.setRecordScope(entity, id, RecordScope{user.OrgID, req.OwnerID, req.TeamID, req.Visibility})
 	writeJSON(w, 200, statusResponse{"ok"})
 }
-func setRecordScope(entity, id string, scope RecordScope) {
-	mu.Lock()
-	defer mu.Unlock()
+
+func handleRecordAccess(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleRecordAccess(w, r)
+}
+func (state *runtimeStore) setRecordScope(entity, id string, scope RecordScope) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	update := func(items any) {
 		value := reflect.ValueOf(items)
 		for i := 0; i < value.Len(); i++ {
@@ -433,7 +463,7 @@ func setRecordScope(entity, id string, scope RecordScope) {
 			if item.FieldByName("ID").String() == id {
 				item.FieldByName("RecordScope").Set(reflect.ValueOf(scope))
 				ownerName := ""
-				for _, u := range users {
+				for _, u := range state.users {
 					if u.ID == scope.OwnerID {
 						ownerName = u.Name
 					}
@@ -450,32 +480,38 @@ func setRecordScope(entity, id string, scope RecordScope) {
 	}
 	switch entity {
 	case "contacts":
-		update(contacts)
+		update(state.contacts)
 	case "deals":
-		update(deals)
+		update(state.deals)
 	case "tasks":
-		update(tasks)
+		update(state.tasks)
 	case "schools":
-		update(schools)
+		update(state.schools)
 	case "students":
-		update(students)
+		update(state.students)
 	case "agents":
-		update(agents)
+		update(state.agents)
 	case "leads":
-		update(leads)
+		update(state.leads)
 	case "cases":
-		update(cases)
+		update(state.cases)
 	case "documents":
-		update(documents)
+		update(state.documents)
 	case "invoices":
-		update(invoices)
+		update(state.invoices)
 	case "payments":
-		update(payments)
+		update(state.payments)
 	case "partners":
-		update(partners)
+		update(state.partners)
 	case "activities":
-		update(activities)
+		update(state.activities)
 	}
+}
+
+func setRecordScope(entity, id string, scope RecordScope) {
+	state, release := runtimeForCall(nil)
+	defer release()
+	state.setRecordScope(entity, id, scope)
 }
 
 func handleWorkspaceClock(w http.ResponseWriter, r *http.Request) {

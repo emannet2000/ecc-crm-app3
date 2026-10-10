@@ -45,3 +45,18 @@ __pycache__/
 *.tar.gz
 golang-backend/backend
 /golang-backend/backend
+
+# Environment secrets
+.env.*
+!.env.example
+
+# Archived projects
+archive/
+
+# Other database filenames
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

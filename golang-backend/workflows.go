@@ -57,11 +57,11 @@ func invoiceTotal(i Invoice) float64 {
 // and refund is recomputed from the ledger, including deletion of a payment.
 var hiddenLedgerPayments []Payment // protected by mu and the serialized request scope
 
-func recomputeInvoiceLocked(index int) {
-	i := invoices[index]
+func (state *runtimeStore) recomputeInvoiceLocked(index int) {
+	i := state.invoices[index]
 	sum := 0.0
-	for _, p := range append(append([]Payment{}, payments...), hiddenLedgerPayments...) {
-		if p.InvoiceID == i.ID && p.Status != "void" {
+	for _, p := range append(append([]Payment{}, state.payments...), state.hiddenLedgerPayments...) {
+		if p.InvoiceID == i.ID && p.Status != "void" && !pendingReceipt(p) {
 			sum += p.Amount
 		}
 	}
@@ -76,10 +76,16 @@ func recomputeInvoiceLocked(index int) {
 	} else if i.AmountReceived > 0 {
 		i.PaymentMilestone = "Instalment Due"
 	}
-	invoices[index] = i
+	state.invoices[index] = i
 }
-func handleWorkflowOverview(w http.ResponseWriter, r *http.Request) {
-	s := snapshot()
+
+func recomputeInvoiceLocked(index int) {
+	state, release := runtimeForCall(nil)
+	defer release()
+	state.recomputeInvoiceLocked(index)
+}
+func (state *runtimeStore) handleWorkflowOverview(w http.ResponseWriter, r *http.Request) {
+	s := state.snapshot()
 	rates, err := queryObjects(r, "SELECT id,data FROM workspace_entries WHERE org_id=? AND category='exchange_rate'", currentUser(r).OrgID)
 	if err != nil {
 		writeError(w, 500, "Could not load workflows")
@@ -96,6 +102,12 @@ func handleWorkflowOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"deals": s.Deals, "cases": s.Cases, "documents": s.Documents, "students": s.Students, "schools": s.Schools, "agents": s.Agents, "partners": s.Partners, "leads": s.Leads, "contacts": s.Contacts, "tasks": s.Tasks, "invoices": s.Invoices, "payments": s.Payments, "rates": rates, "templates": templates, "ledger": filtered})
 }
+
+func handleWorkflowOverview(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleWorkflowOverview(w, r)
+}
 func visibleRecordID(s diskStore, id string) bool {
 	for _, items := range recordsOf(s) {
 		if _, ok := items[id]; ok {
@@ -104,7 +116,7 @@ func visibleRecordID(s diskStore, id string) bool {
 	}
 	return false
 }
-func handleWorkflow(w http.ResponseWriter, r *http.Request) {
+func (state *runtimeStore) handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req map[string]json.RawMessage
 	if !decodeRequest(w, r, &req) {
 		return
@@ -143,8 +155,8 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 201, map[string]string{"id": saved})
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	fail := func(msg string) { writeError(w, 400, msg) }
 	editable := func(scope RecordScope) bool {
 		if !canWrite(scope, u) {
@@ -155,7 +167,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "deal":
-		for i, d := range deals {
+		for i, d := range state.deals {
 			if d.ID != id {
 				continue
 			}
@@ -201,12 +213,12 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				}
 				d.Value = money(value)
 			}
-			deals[i] = d
+			state.deals[i] = d
 			writeJSON(w, 200, d)
 			return
 		}
 	case "lead-convert":
-		for i, l := range leads {
+		for i, l := range state.leads {
 			if l.ID != id {
 				continue
 			}
@@ -218,7 +230,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var contact Contact
-			for _, c := range contacts {
+			for _, c := range state.contacts {
 				if l.Email != "" && strings.EqualFold(l.Email, c.Email) {
 					if !editable(c.RecordScope) {
 						return
@@ -229,15 +241,15 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 			}
 			if contact.ID == "" {
 				contact = Contact{RecordScope: l.RecordScope, ID: newID("c"), Name: l.Name, Email: l.Email, Phone: l.Phone, Location: l.CurrentCountry, Stage: "Lead", Owner: l.AssignedTo, Notes: l.Notes, Tags: []string{}, CreatedAt: organizationToday(r)}
-				contacts = append(contacts, contact)
+				state.contacts = append(state.contacts, contact)
 			}
-			leads[i].ConvertedContactID = contact.ID
-			leads[i].Status = "Converted"
+			state.leads[i].ConvertedContactID = contact.ID
+			state.leads[i].Status = "Converted"
 			writeJSON(w, 200, map[string]string{"contactId": contact.ID})
 			return
 		}
 	case "lead":
-		for i, l := range leads {
+		for i, l := range state.leads {
 			if l.ID == id {
 				if !editable(l.RecordScope) {
 					return
@@ -247,22 +259,22 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 					fail("Score must be 0–100 and source cost nonnegative")
 					return
 				}
-				leads[i].Score = int(score)
-				leads[i].SourceCost = number("sourceCost")
+				state.leads[i].Score = int(score)
+				state.leads[i].SourceCost = number("sourceCost")
 				if date := text("followUpDate"); date != "" {
 					if _, err := time.Parse("2006-01-02", date); err != nil {
 						fail("Enter a valid follow-up date")
 						return
 					}
-					leads[i].FollowUpDate = date
-					tasks = append(tasks, Task{RecordScope: l.RecordScope, ID: newID("t"), Title: "Follow up: " + l.Name, Description: text("message"), Status: "todo", DueDate: date, Owner: u.Name, CreatedAt: organizationToday(r)})
+					state.leads[i].FollowUpDate = date
+					state.tasks = append(state.tasks, Task{RecordScope: l.RecordScope, ID: newID("t"), Title: "Follow up: " + l.Name, Description: text("message"), Status: "todo", DueDate: date, Owner: u.Name, CreatedAt: organizationToday(r)})
 				}
-				writeJSON(w, 200, leads[i])
+				writeJSON(w, 200, state.leads[i])
 				return
 			}
 		}
 	case "task":
-		for i, t := range tasks {
+		for i, t := range state.tasks {
 			if t.ID == id {
 				if !editable(t.RecordScope) {
 					return
@@ -279,14 +291,14 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
-				tasks[i].Recurrence = rec
-				tasks[i].ReminderDate = date
-				writeJSON(w, 200, tasks[i])
+				state.tasks[i].Recurrence = rec
+				state.tasks[i].ReminderDate = date
+				writeJSON(w, 200, state.tasks[i])
 				return
 			}
 		}
 	case "student":
-		for i, s := range students {
+		for i, s := range state.students {
 			if s.ID == id {
 				if !editable(s.RecordScope) {
 					return
@@ -330,19 +342,19 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 					fail("Choose valid checklist items")
 					return
 				}
-				students[i] = s
+				state.students[i] = s
 				writeJSON(w, 200, s)
 				return
 			}
 		}
 	case "student-case":
-		for _, s := range students {
+		for _, s := range state.students {
 			if s.ID == id {
 				if !editable(s.RecordScope) {
 					return
 				}
 				contact := Contact{}
-				for _, c := range contacts {
+				for _, c := range state.contacts {
 					if strings.EqualFold(c.Name, s.Name) {
 						contact = c
 						break
@@ -350,17 +362,17 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				}
 				if contact.ID == "" {
 					contact = Contact{RecordScope: s.RecordScope, ID: newID("c"), Name: s.Name, Stage: "Client", Owner: u.Name, Tags: []string{}, CreatedAt: organizationToday(r)}
-					contacts = append(contacts, contact)
+					state.contacts = append(state.contacts, contact)
 				}
-				c := Case{RecordScope: s.RecordScope, ID: newID("case"), CaseNumber: fmt.Sprintf("ECC-%d", time.Now().UnixNano()), ClientID: contact.ID, ClientName: s.Name, ServiceCategory: "Study", DestinationCountry: s.CountryCode, VisaType: "Student", SchoolOrEmployer: s.SchoolName, AssignedOfficer: u.Name, DateOpened: organizationToday(r), CurrentStage: "Assessment", Priority: "Normal", CreatedBy: u.Name, CreatedAt: organizationToday(r)}
+				c := Case{RecordScope: s.RecordScope, ID: newID("case"), CaseNumber: fmt.Sprintf("ECC-%d", time.Now().UnixNano()), ClientID: contact.ID, ClientName: s.Name, ServiceCategory: "Study", DestinationCountry: s.CountryCode, VisaType: "Student", SchoolOrEmployer: s.SchoolName, AssignedOfficer: u.Name, DateOpened: organizationToday(r), CurrentStage: "Assessment", Priority: "Medium", CreatedBy: u.Name, CreatedAt: organizationToday(r)}
 				c.StudentID = s.ID
-				cases = append(cases, c)
+				state.cases = append(state.cases, c)
 				writeJSON(w, 201, map[string]any{"case": c})
 				return
 			}
 		}
 	case "case":
-		for i, c := range cases {
+		for i, c := range state.cases {
 			if c.ID != id {
 				continue
 			}
@@ -369,7 +381,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 			}
 			parent := text("parentCaseId")
 			if parent != "" {
-				p, ok := findCaseByID(parent)
+				p, ok := state.findCaseByID(parent)
 				if !ok || p.ID == c.ID {
 					fail("Choose a different visible case")
 					return
@@ -382,7 +394,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					visited[ancestor.ID] = true
-					ancestor, _ = findCaseByID(ancestor.ParentCaseID)
+					ancestor, _ = state.findCaseByID(ancestor.ParentCaseID)
 				}
 			}
 			days := int(number("slaDays"))
@@ -393,7 +405,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 			partner := text("partnerId")
 			if partner != "" {
 				found := false
-				for _, p := range partners {
+				for _, p := range state.partners {
 					found = found || p.ID == partner
 				}
 				if !found {
@@ -424,17 +436,17 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				json.Unmarshal([]byte(payload), &t)
 				for _, name := range strings.Split(t["documents"], "\n") {
 					if strings.TrimSpace(name) != "" {
-						documents = append(documents, Document{RecordScope: c.RecordScope, ID: newID("doc"), CaseID: c.ID, CaseNumber: c.CaseNumber, DocName: strings.TrimSpace(name), Required: true, Status: "Not Requested", CreatedBy: u.Name, CreatedAt: organizationToday(r)})
+						state.documents = append(state.documents, Document{RecordScope: c.RecordScope, ID: newID("doc"), CaseID: c.ID, CaseNumber: c.CaseNumber, DocName: strings.TrimSpace(name), Required: true, Status: "Not Requested", CreatedBy: u.Name, CreatedAt: organizationToday(r)})
 					}
 				}
 				c.TemplateID = template
 			}
-			cases[i] = c
+			state.cases[i] = c
 			writeJSON(w, 200, c)
 			return
 		}
 	case "school":
-		for i, s := range schools {
+		for i, s := range state.schools {
 			if s.ID == id {
 				if !editable(s.RecordScope) {
 					return
@@ -450,13 +462,13 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				}
-				schools[i].Programs = programs
-				writeJSON(w, 200, schools[i])
+				state.schools[i].Programs = programs
+				writeJSON(w, 200, state.schools[i])
 				return
 			}
 		}
 	case "invoice":
-		for i, inv := range invoices {
+		for i, inv := range state.invoices {
 			if inv.ID != id {
 				continue
 			}
@@ -467,7 +479,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				fail("Enter a valid currency and nonnegative tax and discount")
 				return
 			}
-			for _, p := range payments {
+			for _, p := range state.payments {
 				if p.InvoiceID == id && currencyOf(inv.Currency) != text("currency") {
 					fail("Currency cannot change after payments are recorded")
 					return
@@ -484,9 +496,9 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			json.Unmarshal(req["dunning"], &inv.Dunning)
-			invoices[i] = inv
-			recomputeInvoiceLocked(i)
-			writeJSON(w, 200, invoices[i])
+			state.invoices[i] = inv
+			state.recomputeInvoiceLocked(i)
+			writeJSON(w, 200, state.invoices[i])
 			return
 		}
 	case "credit-note":
@@ -494,7 +506,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 403, "Manager approval is required")
 			return
 		}
-		for i, inv := range invoices {
+		for i, inv := range state.invoices {
 			if inv.ID == id {
 				amount := money(number("amount"))
 				if amount <= 0 || amount > invoiceTotal(inv) || text("reason") == "" {
@@ -506,14 +518,14 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 					writeError(w, 500, "Could not save credit note")
 					return
 				}
-				invoices[i].CreditAmount += amount
-				recomputeInvoiceLocked(i)
-				writeJSON(w, 200, invoices[i])
+				state.invoices[i].CreditAmount += amount
+				state.recomputeInvoiceLocked(i)
+				writeJSON(w, 200, state.invoices[i])
 				return
 			}
 		}
 	case "refund-request":
-		for i, inv := range invoices {
+		for i, inv := range state.invoices {
 			if inv.ID == id {
 				if !editable(inv.RecordScope) {
 					return
@@ -528,7 +540,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 					writeError(w, 500, "Could not request refund")
 					return
 				}
-				invoices[i].RefundStatus = "Requested"
+				state.invoices[i].RefundStatus = "Requested"
 				writeJSON(w, 201, map[string]string{"id": e})
 				return
 			}
@@ -546,7 +558,7 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 		var refund map[string]any
 		json.Unmarshal([]byte(payload), &refund)
 		index := -1
-		for i, inv := range invoices {
+		for i, inv := range state.invoices {
 			if inv.ID == invoiceID {
 				index = i
 			}
@@ -570,26 +582,26 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 			refund["status"] = decision
 			refund["reviewedBy"] = u.ID
 		} else if action == "refund-process" {
-			if status != "approved" || amount > invoices[index].AmountReceived || text("reference") == "" {
+			if status != "approved" || amount > state.invoices[index].AmountReceived || text("reference") == "" {
 				fail("Refund must be approved, within available receipts, and have a payment reference")
 				return
 			}
-			p := Payment{RecordScope: invoices[index].RecordScope, ID: newID("pay"), InvoiceID: invoiceID, Amount: -amount, Status: "refund", PaidOn: organizationToday(r), Method: "Refund", Reference: text("reference"), CreatedBy: u.Name, CreatedAt: organizationToday(r)}
-			payments = append(payments, p)
+			p := Payment{RecordScope: state.invoices[index].RecordScope, ID: newID("pay"), InvoiceID: invoiceID, Amount: -amount, Status: "refund", PaidOn: organizationToday(r), Method: "Refund", Reference: text("reference"), CreatedBy: u.Name, CreatedAt: organizationToday(r)}
+			state.payments = append(state.payments, p)
 			refund["paymentId"] = p.ID
 			refund["status"] = "processed"
 			refund["reference"] = text("reference")
-			recomputeInvoiceLocked(index)
+			state.recomputeInvoiceLocked(index)
 		} else {
 			if status != "processed" || text("reference") == "" {
 				fail("Only processed refunds can be reversed with a reference")
 				return
 			}
-			payments = append(payments, Payment{RecordScope: invoices[index].RecordScope, ID: newID("pay"), InvoiceID: invoiceID, Amount: amount, Status: "refund_reversal", PaidOn: organizationToday(r), Method: "Refund reversal", Reference: text("reference"), CreatedBy: u.Name, CreatedAt: organizationToday(r)})
+			state.payments = append(state.payments, Payment{RecordScope: state.invoices[index].RecordScope, ID: newID("pay"), InvoiceID: invoiceID, Amount: amount, Status: "refund_reversal", PaidOn: organizationToday(r), Method: "Refund reversal", Reference: text("reference"), CreatedBy: u.Name, CreatedAt: organizationToday(r)})
 			refund["status"] = "reversed"
-			recomputeInvoiceLocked(index)
+			state.recomputeInvoiceLocked(index)
 		}
-		invoices[index].RefundStatus = fmt.Sprint(refund["status"])
+		state.invoices[index].RefundStatus = fmt.Sprint(refund["status"])
 		_, err := storeDB(r).Exec("UPDATE workspace_entries SET data=?,updated_at=? WHERE id=?", mustJSON(refund), utcNow(), id)
 		if err != nil {
 			writeError(w, 500, "Could not save refund")
@@ -604,12 +616,12 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 		kind := text("entity")
 		found := false
-		for _, a := range agents {
+		for _, a := range state.agents {
 			if kind == "agents" && a.ID == id {
 				found = true
 			}
 		}
-		for _, p := range partners {
+		for _, p := range state.partners {
 			if kind == "partners" && p.ID == id {
 				found = true
 			}
@@ -645,19 +657,25 @@ func handleWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	writeError(w, 404, "Record or workflow not found")
 }
-func handleInvoiceEmail(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
+
+func handleWorkflow(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleWorkflow(w, r)
+}
+func (state *runtimeStore) handleInvoiceEmail(w http.ResponseWriter, r *http.Request) {
+	state.mu.RLock()
 	var inv Invoice
 	var client Contact
 	ok := false
-	for _, i := range invoices {
+	for _, i := range state.invoices {
 		if i.ID == r.PathValue("id") {
 			inv = i
-			client, _ = findContactByID(i.ClientID)
+			client, _ = state.findContactByID(i.ClientID)
 			ok = true
 		}
 	}
-	mu.RUnlock()
+	state.mu.RUnlock()
 	if !ok {
 		writeError(w, 404, "Invoice not found")
 		return
@@ -671,6 +689,12 @@ func handleInvoiceEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 202, map[string]string{"status": "queued"})
+}
+
+func handleInvoiceEmail(w http.ResponseWriter, r *http.Request) {
+	state, release := runtimeForCall(r)
+	defer release()
+	state.handleInvoiceEmail(w, r)
 }
 func handleSaveView(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -708,70 +732,98 @@ func handleDeleteView(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, statusResponse{"ok"})
 }
-func applyComputedData() {
-	mu.Lock()
-	defer mu.Unlock()
-	for i := range agents {
-		agents[i].StudentsReferred = 0
-		for _, s := range students {
-			if s.AgentID == agents[i].ID {
-				agents[i].StudentsReferred++
+func (state *runtimeStore) applyComputedData() {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	agentCount, schoolCount, partnerCount, partnerConverted := map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}
+	for _, s := range state.students {
+		agentCount[s.AgentID]++
+		if s.AcceptanceStatus == "Enrolled" || s.ApplicationStage == "Enrolled" {
+			schoolCount[s.SchoolID]++
+		}
+	}
+	for _, c := range state.cases {
+		partnerCount[c.PartnerID]++
+		if c.CurrentStage == "Approved" || c.CurrentStage == "Closed" {
+			partnerConverted[c.PartnerID]++
+		}
+	}
+	for i := range state.agents {
+		state.agents[i].StudentsReferred = agentCount[state.agents[i].ID]
+	}
+	for i := range state.schools {
+		state.schools[i].StudentsEnrolled = schoolCount[state.schools[i].ID]
+	}
+	for i := range state.partners {
+		state.partners[i].CasesReferred = partnerCount[state.partners[i].ID]
+		state.partners[i].CasesConverted = partnerConverted[state.partners[i].ID]
+	}
+	currencies := map[string]string{}
+	for _, inv := range state.invoices {
+		currencies[inv.ID] = currencyOf(inv.Currency)
+	}
+	sums := map[string]float64{}
+	for i := range state.payments {
+		p := &state.payments[i]
+		if currency, ok := currencies[p.InvoiceID]; ok {
+			p.Currency = currency
+		}
+		if p.Status == "" {
+			p.Status = "posted"
+		}
+		if p.Status != "void" && !pendingReceipt(*p) {
+			sums[p.InvoiceID] += p.Amount
+		}
+	}
+	for _, p := range state.hiddenLedgerPayments {
+		if p.Status != "void" && !pendingReceipt(p) {
+			sums[p.InvoiceID] += p.Amount
+		}
+	}
+	for i := range state.invoices {
+		inv := &state.invoices[i]
+		sum := sums[inv.ID]
+		if !inv.LedgerInitialized {
+			inv.OpeningReceived = money(inv.AmountReceived - sum)
+			inv.LedgerInitialized = true
+		}
+		inv.AmountReceived = money(inv.OpeningReceived + sum)
+		inv.Balance = money(invoiceTotal(*inv) - inv.AmountReceived)
+		if inv.Balance <= 0 {
+			inv.PaymentMilestone = "Fully Paid"
+		} else if inv.AmountReceived > 0 {
+			inv.PaymentMilestone = "Instalment Due"
+		}
+	}
+	required, verified := map[string]int{}, map[string]int{}
+	for _, d := range state.documents {
+		if d.Required {
+			required[d.CaseID]++
+			if d.Status == "Verified" {
+				verified[d.CaseID]++
 			}
 		}
 	}
-	for i := range schools {
-		schools[i].StudentsEnrolled = 0
-		for _, s := range students {
-			if s.SchoolID == schools[i].ID && (s.AcceptanceStatus == "Enrolled" || s.ApplicationStage == "Enrolled") {
-				schools[i].StudentsEnrolled++
-			}
-		}
-	}
-	for i := range partners {
-		partners[i].CasesReferred = 0
-		partners[i].CasesConverted = 0
-		for _, c := range cases {
-			if c.PartnerID == partners[i].ID {
-				partners[i].CasesReferred++
-				if c.CurrentStage == "Approved" || c.CurrentStage == "Closed" {
-					partners[i].CasesConverted++
-				}
-			}
-		}
-	}
-	for p := range payments {
-		for _, inv := range invoices {
-			if inv.ID == payments[p].InvoiceID {
-				payments[p].Currency = currencyOf(inv.Currency)
-			}
-		}
-		if payments[p].Status == "" {
-			payments[p].Status = "posted"
-		}
-	}
-	for i := range invoices {
-		recomputeInvoiceLocked(i)
-	}
-	for i := range cases {
-		if !cases[i].AutoAdvance {
+	for i := range state.cases {
+		c := &state.cases[i]
+		if !c.AutoAdvance {
 			continue
 		}
-		required, verified := 0, 0
-		for _, d := range documents {
-			if d.CaseID == cases[i].ID && d.Required {
-				required++
-				if d.Status == "Verified" {
-					verified++
-				}
-			}
+		if required[c.ID] > verified[c.ID] && c.CurrentStage == "Ready for Submission" {
+			c.CurrentStage = "Documents Under Review"
 		}
-		if required > verified && cases[i].CurrentStage == "Ready for Submission" {
-			cases[i].CurrentStage = "Documents Under Review"
-		}
-		if required > 0 && required == verified && (cases[i].CurrentStage == "Documents Pending" || cases[i].CurrentStage == "Documents Under Review") {
-			cases[i].CurrentStage = "Ready for Submission"
+		if required[c.ID] > 0 && required[c.ID] == verified[c.ID] && (c.CurrentStage == "Documents Pending" || c.CurrentStage == "Documents Under Review") {
+			c.CurrentStage = "Ready for Submission"
 		}
 	}
+
+}
+
+func applyComputedData() {
+	state, release := runtimeForCall(nil)
+	defer release()
+	state.applyComputedData()
 }
 func sortRecords[T any](items []T, r *http.Request) []T {
 	field := r.URL.Query().Get("sort")
